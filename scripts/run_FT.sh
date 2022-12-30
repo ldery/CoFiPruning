@@ -5,9 +5,9 @@
 glue_low=(MRPC RTE STS-B CoLA)
 glue_high=(MNLI QQP QNLI SST-2)
 
-proj_dir=$n/space2
+proj_dir=CoFI_runs
 
-code_dir=${proj_dir}/CoFiPruning
+code_dir=.
 
 
 # task and data
@@ -30,9 +30,9 @@ fi
 
 # train parameters
 max_seq_length=128
-batch_size=32
-learning_rate=2e-5
-epochs=5
+# batch_size=32
+
+# epochs=5
 
 # seed
 seed=57
@@ -40,19 +40,29 @@ seed=57
 # output directory
 ex_name_suffix=$2
 ex_name=${task_name}_${ex_name_suffix}
-output_dir=$proj_dir/out-test/${task_name}/${ex_name}
+
+
+pretrained_pruned_model=${4}
+learning_rate=$3
+scheduler_type=none
+output_dir=$pretrained_pruned_model/FT-lr${learning_rate}
+epochs=20
+batch_size=64
+
+
 mkdir -p $output_dir
 pruning_type=None
+
 
 python3 $code_dir/run_glue_prune.py \
 	   --output_dir ${output_dir} \
 	   --logging_steps ${logging_steps} \
 	   --task_name ${task_name} \
-	   --data_dir ${data_dir} \
 	   --model_name_or_path ${model_name_or_path} \
 	   --ex_name ${ex_name} \
 	   --do_train \
 	   --do_eval \
+	   --pretrained_pruned_model ${pretrained_pruned_model} \
 	   --max_seq_length ${max_seq_length} \
 	   --per_device_train_batch_size ${batch_size} \
 	   --per_device_eval_batch_size 32 \
