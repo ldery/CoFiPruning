@@ -653,7 +653,7 @@ class CoFiTrainer(Trainer):
             reduction="batchmean") * (self.additional_args.distill_temp ** 2)
 
         loss = self.additional_args.distill_ce_loss_alpha * ce_distill_loss
-        if distill_loss is not None:
+        if distill_loss  is not None:
             loss += self.additional_args.distill_loss_alpha * distill_loss
 
         return distill_loss, ce_distill_loss, loss

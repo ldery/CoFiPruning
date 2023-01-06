@@ -1,5 +1,5 @@
 TASK=RTE #CoLA #MNLI
-SUFFIX=startwbertbase_sparsity0.95 # startwfinetuned_sparsity0.95 # 
+SUFFIX=randomized_ #myapproach_ #startwbertbase_sparsity0.95 # startwfinetuned_sparsity0.95 # 
 EX_CATE=CoFi
 PRUNING_TYPE=structured_heads+structured_mlp+hidden+layer
 SPARSITY=0.95

@@ -196,7 +196,7 @@ def main():
         )
         teacher_model.eval() #! inside has a cofibertmodel #! CofiBertForSequenceClassification
 
-    config.do_layer_distill = additional_args.do_layer_distill #! True
+#     config.do_layer_distill = additional_args.do_layer_distill #! True
 
     model = Model.from_pretrained(
         model_args.model_name_or_path,
@@ -207,9 +207,9 @@ def main():
         use_auth_token=True if model_args.use_auth_token else None,
     ) #! inside the function, we get the original struct  #! CofiBertForSequenceClassification
 
-    # initialize the layer transformation matrix to be an identity matrix
-    if additional_args.do_layer_distill:
-        initialize_layer_transformation(model)
+#     # initialize the layer transformation matrix to be an identity matrix
+#     if additional_args.do_layer_distill:
+#         initialize_layer_transformation(model)
 
     logger.info(model)
     logger.info(f"Model size: {calculate_parameters(model)}")

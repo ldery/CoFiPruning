@@ -23,6 +23,7 @@ def load_model_with_zs(model_path, model_class, zs=None):
     model = model_class.from_pretrained(model_path, config=config)
     p = os.path.join(model_path, "pytorch_model.bin")
     loaded_weights = torch.load(p, map_location="cpu")
+
     model.load_state_dict(loaded_weights)
     print(f"Load weights from {model_path}")
 
