@@ -1,4 +1,5 @@
 from collections import defaultdict
+from functools import partial
 import math
 import os
 import sys
@@ -80,8 +81,12 @@ class My_Trainer(Trainer):
 		self.start_prune = False
 
 		self.l0_optimizer = None
+
 		self.best_zs = None
+		self.nlayers = self.l0_module.num_hidden_layers
+		self.nheads_per_layer =  self.l0_module.num_attention_heads
 		self.num_labels = model.num_labels
+
 		self.lagrangian_optimizer = None
 
 		self.start_saving_best = True if self.additional_args.pruning_type is None else False
@@ -102,102 +107,147 @@ class My_Trainer(Trainer):
 			v_.zero_().fill_(0.5)
 			v_.requires_grad = False
 			self.base_zs[k] = v_
-
-
-# 	def generation_step(self, mask_, model_, inputs):
 		
+		self.train_batcher = iter(self.get_train_dataloader())
+		self.val_batcher = iter(self.get_eval_dataloader())
+
+	def get_next_batch(self, is_train=True):
+		this_batcher = self.train_batcher if is_train else self.val_batcher
+		try:
+			batch_ = next(this_batcher)
+		except:
+			if is_train:
+				self.train_batcher = iter(self.get_train_dataloader())
+				batch_ = next(self.train_batcher)
+			else:
+				self.val_batcher = iter(self.get_eval_dataloader())
+				batch_ = next(self.val_batcher)
+		return batch_
+
+	def run_through_model(self, model_mask, inputs):
+		self.fill_inputs_with_zs(model_mask, inputs)
+		inputs = self._prepare_inputs(inputs)
+		embeds = self.model(**inputs)['pooler_output']
+		return embeds, inputs.get("labels")
+
 
 	def train(self):
-# 		# TODO[ldery] - go from hard-coded value
-# 		n_total_masks = 2000
-# 		mask_embeddings_map = []
+		# TODO[ldery] - go from hard-coded value
+		n_total_masks = 1 #10000
+		mask_embeddings_map = []
+		arch_comp_keys = ['head_z', 'mlp_z']
 
-# 		train_dataloader = iter(self.get_train_dataloader())
-# 		val_dataloader = iter(self.get_eval_dataloader())
-# 		for mask_ in tqdm(range(n_total_masks)):
-# 			with torch.no_grad():
-# 				# Fix this nasty thing later
-# 				try:
-# 					tr_inputs = next(train_dataloader)
-# 				except:
-# 					train_dataloader = iter(self.get_train_dataloader())
-# 					tr_inputs = next(train_dataloader)
-				
-# 				try:
-# 					val_inputs = next(val_dataloader)
-# 				except:
-# 					val_dataloader = iter(self.get_train_dataloader())
-# 					val_inputs = next(val_dataloader)
+		self.model.eval()
+		not_random_ = True
+		if not_random_:
+			for mask_ in tqdm(range(n_total_masks)):
+				with torch.no_grad():
+					# Get a batch of data
+					tr_inputs = self.get_next_batch(is_train=True)
+					val_inputs = self.get_next_batch(is_train=False)
+					cur_mask = self.gen_random_mask(arch_comp_keys)
 
-# 				cur_mask = self.gen_random_mask()
+					self.fill_inputs_with_zs(cur_mask, val_inputs)
+					val_inputs = self._prepare_inputs(val_inputs)
+					val_embeds = self.model(**val_inputs)['pooler_output']
 
-# 				self.fill_inputs_with_zs(cur_mask, tr_inputs)
-# 				tr_inputs = self._prepare_inputs(tr_inputs)
-# 				tr_embeds = self.model(**tr_inputs)['pooler_output']
+					pair_ = (cur_mask, (self.run_through_model(cur_mask, tr_inputs), self.run_through_model(cur_mask, val_inputs)))
+					mask_embeddings_map.append(pair_)
 
-# 				self.fill_inputs_with_zs(cur_mask, val_inputs)
-# 				val_inputs = self._prepare_inputs(val_inputs)
-# 				val_embeds = self.model(**val_inputs)['pooler_output']
+			# mask_embeddings_map => {mask : # [(tr_x, tr_y), (val_x, val_y)]}
+			self.best_zs = self.get_best_mask(mask_embeddings_map, arch_comp_keys)
+		else:
+			self.best_zs = self.gen_random_mask(arch_comp_keys) #self.head_choices_to_masks(best_heads)
+			best_heads = [(i_, np.random.choice(12)) for i_ in range(12)]
+			self.best_zs['head_z'] = torch.zeros_like(self.best_zs['head_z'])
+			self.best_zs['mlp_z'] = torch.zeros_like(self.best_zs['mlp_z'])
+			for p_ in best_heads:
+				self.best_zs['head_z'][p_[0], :, p_[1], :, :] = 1.0
 
-# 				pair_ = (cur_mask, ((tr_embeds, tr_inputs.get("labels")), (val_embeds, val_inputs.get("labels"))))
-# 				mask_embeddings_map.append(pair_)
-		
-# # 		pdb.set_trace()
-# 		# mask_embeddings_map => {mask : # [(tr_x, tr_y), (val_x, val_y)]}
-# 		self.best_zs = self.get_best_head_mask(mask_embeddings_map)
-		best_heads = [(i_, np.random.choice(12)) for i_ in range(12)]
-# 		print(best_heads)
-		self.best_zs = self.head_choices_to_masks(best_heads)
-		print(self.best_zs)
-		pdb.set_trace()
-		print('this is a test')
-		
+			for l in np.random.choice(12, 3):
+				self.best_zs['mlp_z'][l] = 1.0
+			print(self.best_zs)
 
-	# Start simple with just the heads !!
-	def get_best_head_mask(self, mask_embeddings_map):
-		# TODO [ldery]
-		# Only look @ the heads first. Will generalize later
+	def get_best_mask(self, mask_embeddings_map, arch_comp_keys):
+		best_mask = None
+		for key in arch_comp_keys:
+			if key == 'head_z':
+				scores = self.get_attnhead_scores(mask_embeddings_map)
+				mean_, std_ = np.mean(scores, axis=1, keepdims=True), np.std(scores, axis=1, keepdims=True)
+				normalized_scores = (scores - mean_) / (std_ + 1e-8) # epsilon
+				normalized_scores = normalized_scores[:, :, 0] - normalized_scores[:, :, 1]
+				best_heads = np.argmax(normalized_scores, axis=-1)
+			elif key == 'mlp_z':
+				scores = self.get_mlp_scores(mask_embeddings_map)
+				mean_, std_ = np.mean(scores, axis=1, keepdims=True), np.std(scores, axis=1, keepdims=True)
+				normalized_scores = (scores - mean_) / (std_ + 1e-8) # epsilon
+				normalized_scores = normalized_scores[:, 0] - normalized_scores[:, 1]
+				best_heads = np.argsort(normalized_scores)[:3] # 3 is hardcoded for now
+			pdb.set_trace()
+			best_mask = self.arch_choices_to_masks(best_heads, mask_to_update=best_mask, key=key)
+		print([best_mask[k] for k in arch_comp_keys])
+		return best_mask
+
+	def get_mlp_scores(self, mask_embeddings_map):
+		def mlp_is_on(mlp_id, mask_dict):
+			return (mask_dict['mlp_z'][mlp_id]).item() == 1
+
 		delta_perfs = defaultdict(float)
-		best_heads = []
-		for l_ in range(12): # Hard coded - fix 
+		mlp_scores = []
+		for l_ in range(self.nlayers):
 			deltas = []
-			for h_ in range(12): # Hard coded - fix 
-				# separate masks into those with head turned on and those with it turned off
-				on_embeds, off_embeds = self.separate_embeddings_for_head(mask_embeddings_map, (l_, h_))
-				delta_perf = self.linear_fit_and_evaluate(on_embeds, off_embeds)
-				delta_perfs[(l_, h_)] = delta_perf
-				deltas.append(delta_perf)
-			best_heads.append((l_, np.argmax(deltas)))
-		# create a new mask from the keys
-		print(best_heads)
-		pdb.set_trace()
-		return self.head_choices_to_masks(best_heads)
+			on_embeds, off_embeds = self.separate_embeddings(mask_embeddings_map, partial(mlp_is_on, l_))
+			delta_perf = self.linear_fit_and_evaluate(on_embeds, off_embeds)
+			mlp_scores.append(delta_perf)
+		return np.array(mlp_scores)
 
-	def separate_embeddings_for_head(self, mask_embeddings_map, head_id):
+	def get_attnhead_scores(self, mask_embeddings_map):
+		def head_is_on(head_id, mask_dict):
+			return (mask_dict['head_z'][head_id[0], :, head_id[1], :, :]).item() == 1
+
+		delta_perfs = defaultdict(float)
+		head_scores = []
+		for l_ in range(self.nlayers):
+			deltas = []
+			for h_ in range(self.nheads_per_layer):
+				# separate masks into those with head turned on and those with it turned off
+				on_embeds, off_embeds = self.separate_embeddings(mask_embeddings_map, partial(head_is_on, (l_, h_)))
+				delta_perf = self.linear_fit_and_evaluate(on_embeds, off_embeds)
+				deltas.append(delta_perf)
+			head_scores.append(deltas)
+		return np.array(head_scores)
+
+	def separate_embeddings(self, mask_embeddings_map, check_activated):
 		on_embs = [[[], []], [[], []]] # [train(x, y), val(x, y)]
 		off_embs = deepcopy(on_embs)
 		for (mask_, embeds_) in mask_embeddings_map:
 			(tr_x, tr_y), (val_x, val_y) = embeds_
-			is_off = (mask_['head_z'][head_id[0], :, head_id[1], :, :]).item() == 0
-			to_use = off_embs if is_off else on_embs
+			to_use = on_embs if check_activated(mask_) else off_embs
 			to_use[0][0].append(tr_x)
 			to_use[0][1].append(tr_y)
 			to_use[1][0].append(val_x)
 			to_use[1][1].append(val_y)
 		return on_embs, off_embs
 
-	def head_choices_to_masks(self, best_head_ids): # TODO[ldery] - clean up and standardized naming
-		this_mask = {k: torch.ones_like(v) for k, v in self.base_zs.items()}
-# 		this_mask['head_z'] = torch.zeros_like(this_mask['head_z'])
-# 		for l, h_id in enumerate(best_head_ids):
-# 			this_mask['head_z'][l, :, h_id, :, :] = 1.0
-		return this_mask
+	def arch_choices_to_masks(self, choices, mask_to_update=None, key='head_z'):
+		def update_fn(choices, key, tensor_):
+			tensor_.zero_()
+			if key == 'head_z':
+				for l, h_id in enumerate(choices):
+					tensor_[l, :, h_id, :, :] = 1.0
+			elif key == 'mlp_z':
+				tensor_[choices] = 1.0
+			return tensor_
 
-	def gen_random_mask(self, key='head_z'):
+		if mask_to_update is None:
+			mask_to_update = {k: torch.ones_like(v) for k, v in self.base_zs.items()}
+		mask_to_update[key] = update_fn(choices, key, mask_to_update[key])
+		return mask_to_update
+
+	def gen_random_mask(self, arch_comp_keys):
 		mask = {}
-		# TODO [ldery] - generalize for non-heads
 		for k, v in self.base_zs.items():
-			if k == key:
+			if k in arch_comp_keys:
 				assert (v == 0.5).all(), 'There should be equal odds of unit being turned on or off'
 				mask[k] = torch.bernoulli(v)
 			else:
@@ -210,20 +260,20 @@ class My_Trainer(Trainer):
 		def fit_and_evaluate(train_, test_):
 			xs, ys = train_
 			xs, ys = torch.concat(xs), torch.concat(ys)
-			print(xs.shape, ys.shape)
+
 			# Run N-GD Steps to learn linear classifier
 			linear_model = torch.nn.Sequential(nn.BatchNorm1d(xs.shape[-1]), nn.Linear(xs.shape[-1], self.num_labels))
 			linear_model.to(xs.device)
-			optim = Adam(linear_model.parameters(), lr=1e-3) # TODO [ldery] - ablate a reasonable learning rate.
-# 			print('iterating ... ')
-			for j_ in range(10): # TODO[ldery] - ablate the number of steps
+			optim = Adam(linear_model.parameters(), lr=1e-2) # TODO [ldery] - ablate a reasonable learning rate.
+			print('iterating ... ')
+			for j_ in range(20): # TODO[ldery] - ablate the number of steps
 				optim.zero_grad()
 				logits_ = linear_model(xs).view(-1, self.num_labels)
 				loss_ = CrossEntropyLoss()(logits_, ys.view(-1))
 				loss_.backward()
 				optim.step()
-				if j_ % 10 == 0:
-					print(j_, loss_.item())
+# 				if j_ % 9 == 0:
+				print(j_, loss_.item())
 			# Do the evaluation
 			linear_model.eval()
 			with torch.no_grad():
@@ -231,9 +281,11 @@ class My_Trainer(Trainer):
 				xs, ys = torch.concat(xs), torch.concat(ys)
 				preds = linear_model(xs)
 			return self.compute_metrics(EvalPrediction(predictions=preds.cpu(), label_ids=ys.cpu()))['accuracy'] # We are assuming we are dealing with classification only for now
-		on_result = fit_and_evaluate(tr_on, eval_on)
-		off_result = fit_and_evaluate(tr_off, eval_off)
-		return on_result - off_result
+
+		on_result = fit_and_evaluate(tr_on, eval_on) if len(tr_on[0]) > 0 else -1
+		off_result = fit_and_evaluate(tr_off, eval_off) if len(tr_off[0]) > 0 else -1
+		print(on_result, off_result)
+		return on_result, off_result
 
 
 	def save_model(self, output_dir: Optional[str] = None):
@@ -248,114 +300,6 @@ class My_Trainer(Trainer):
 
 		self.model.save_pretrained(output_dir)
 
-	def calculate_layer_distillation_loss(self, teacher_outputs, student_outputs, zs):
-		mse_loss = torch.nn.MSELoss(reduction="mean")
-		if self.additional_args.do_layer_distill: #! only do layer distill
-			mlp_z = None
-			head_layer_z = None
-			# logger.info(f"zs={zs}")
-			if "mlp_z" in zs:
-				mlp_z = zs["mlp_z"].detach().cpu()
-			if "head_layer_z" in zs:
-				head_layer_z = zs["head_layer_z"].detach().cpu()
-
-			teacher_layer_output = teacher_outputs[2][1:] #! hidden states, with a length of 12. Every has a shape of [32, 65, 768]
-			student_layer_output = student_outputs[2][1:] 
-
-			# distilliting existing layers
-			if self.additional_args.layer_distill_version == 2:
-				for layer_num, (t_layer_o, s_layer_o) in enumerate(zip(teacher_layer_output, student_layer_output)):
-					s_layer_o = self.model.layer_transformation(s_layer_o)
-					l = mse_loss(t_layer_o, s_layer_o)
-					if mlp_z is None or mlp_z[layer_num] > 0:
-						layer_loss += l
-
-			# distilling layers with a minimal distance
-			elif self.additional_args.layer_distill_version > 2:
-				l = []
-				if self.additional_args.layer_distill_version > 4:
-					specified_teacher_layers = [i for i in range(12)]
-					if self.additional_args.layer_distill_version ==5:
-						specified_teacher_layers = sorted(random.sample(specified_teacher_layers, 4))
-					elif self.additional_args.layer_distill_version ==6:
-						result_layers_T= []
-						skip_window = len(specified_teacher_layers)//4
-						for i in range(0, len(specified_teacher_layers), skip_window):
-							result_layers_T.append(random.sample(specified_teacher_layers[i:i+skip_window], 1)[0])
-						specified_teacher_layers = result_layers_T
-					specified_teacher_layers[0] = max(2, specified_teacher_layers[0])
-				else:
-					specified_teacher_layers = [2, 5, 8, 11]
-				# logger.info(f"sampled teacher layers: {specified_teacher_layers}")
-				transformed_s_layer_o = [self.model.layer_transformation(
-					s_layer_o) for s_layer_o in student_layer_output]
-				specified_teacher_layer_reps = [
-					teacher_layer_output[i] for i in specified_teacher_layers] #! teacher: 4x[32,113,768]
-
-				device = transformed_s_layer_o[0].device
-				for t_layer_o in specified_teacher_layer_reps:
-					for i, s_layer_o in enumerate(transformed_s_layer_o): #! student: 12x[32,113,768]
-						l.append(mse_loss(t_layer_o, s_layer_o))
-				layerwiseloss = torch.stack(l).reshape(
-					len(specified_teacher_layer_reps), len(student_layer_output)) #! [4,12]
-
-				existing_layers = None
-				if head_layer_z is not None:
-					existing_layers = head_layer_z != 0
-					existing_layers = existing_layers.to(layerwiseloss.device)
-
-				layer_loss = 0
-				#! no ordering restriction specified
-				if self.additional_args.layer_distill_version == 3:
-					alignment = torch.argmin(layerwiseloss, dim=1)
-				#! added the ordering restriction -> to choose the min loss in 4 student layers
-				elif self.additional_args.layer_distill_version in (3, 4, 5, 6):
-					last_aligned_layer = 12
-					alignment = []
-					for search_index in range(len(specified_teacher_layers)-1, -1, -1):
-						indexes = layerwiseloss[search_index].sort()[1]
-						if existing_layers is not None:
-							align = indexes[(
-								indexes < last_aligned_layer) & existing_layers]
-						else:
-							align = indexes[indexes < last_aligned_layer]
-						if len(align) > 0:
-							align = align[0]
-						else:
-							align = last_aligned_layer
-						alignment.append(align)
-						last_aligned_layer = align
-					alignment.reverse()
-					alignment = torch.tensor(alignment).to(device)
-				else:
-					logger.info(
-						f"{self.additional_args.layer_distill_version} version is not specified.")
-					sys.exit()
-
-				layerwise = torch.arange(len(specified_teacher_layers)).to(device)
-				layer_loss += layerwiseloss[layerwise, alignment].sum() #! layerwise: teacher (specified layers) / alignment: student (min loss layers) / layerwiseloss: [4,12]
-				if self.global_step % 100 == 0:
-					logger.info(f"v{self.additional_args.layer_distill_version} Global step: {self.global_step}, Alignment: " + str(alignment))
-			return layer_loss
-		else:
-			return None
-
-	def calculate_distillation_loss(self, teacher_outputs, student_outputs, zs):
-		layer_loss = self.calculate_layer_distillation_loss(teacher_outputs, student_outputs, zs)
-		distill_loss = layer_loss
-
-		ce_distill_loss = F.kl_div(
-			input=F.log_softmax(
-				student_outputs[1] / self.additional_args.distill_temp, dim=-1), #! logits: [32,3]
-			target=F.softmax(
-				teacher_outputs[1] / self.additional_args.distill_temp, dim=-1), #! distill_temp: 2.0
-			reduction="batchmean") * (self.additional_args.distill_temp ** 2)
-
-		loss = self.additional_args.distill_ce_loss_alpha * ce_distill_loss
-		if distill_loss is not None:
-			loss += self.additional_args.distill_loss_alpha * distill_loss
-
-		return distill_loss, ce_distill_loss, loss
 
 	def shortens_inputs(self, inputs):
 		max_length = inputs["attention_mask"].sum(-1).max().item()
@@ -363,55 +307,6 @@ class My_Trainer(Trainer):
 		inputs["attention_mask"] = inputs["attention_mask"][:, :max_length]
 		if "token_type_ids" in inputs:
 			inputs["token_type_ids"] = inputs["token_type_ids"][:, :max_length]
-
-
-	def training_step(self, model: torch.nn.Module, inputs: Dict[str, Union[torch.Tensor, Any]]) -> List[torch.Tensor]:
-		model.train()
-		if self.l0_module is not None:
-			self.l0_module.train()
-		inputs = self._prepare_inputs(inputs)
-
-		distill_loss = None
-		distill_ce_loss = None
-		if self.teacher_model is not None:
-			with torch.no_grad():
-				# only retain inputs of certain keys
-				teacher_inputs_keys = ["input_ids", "attention_mask", "token_type_ids", "position_ids", "labels",
-									   "output_attentions", "output_hidden_states", "return_dict"]
-				teacher_inputs = {key: inputs[key]
-								  for key in teacher_inputs_keys if key in inputs}
-				self.shortens_inputs(teacher_inputs)
-				teacher_outputs = self.teacher_model(**teacher_inputs)
-			self.shortens_inputs(inputs)
-			student_outputs = model(**inputs) #! get the two outputs
-
-			zs = {key: inputs[key] for key in inputs if "_z" in key} #! extract the zs
-			distill_loss, distill_ce_loss, loss = self.calculate_distillation_loss(
-				teacher_outputs, student_outputs, zs)
-		else:
-			loss = self.compute_loss(model, inputs)
-
-		lagrangian_loss = None
-		if self.start_prune:
-			lagrangian_loss, _, _ = \
-				self.l0_module.lagrangian_regularization(
-					self.global_step - self.prepruning_finetune_steps)
-			loss += lagrangian_loss
-
-		if self.args.gradient_accumulation_steps > 1:
-			loss = loss / self.args.gradient_accumulation_steps
-
-		loss.backward()
-
-		# wandb.log({"loss": loss.detach(),
-		#         "lagrangian_loss": lagrangian_loss.detach() if lagrangian_loss is not None else None,
-		#         "distill_layer_loss": distill_loss.detach() if distill_loss is not None else None,
-		#         "distill_ce_loss": distill_ce_loss.detach() if distill_ce_loss is not None else None})
-
-		return {"loss": loss.detach(),
-				"lagrangian_loss": lagrangian_loss.detach() if lagrangian_loss is not None else None,
-				"distill_layer_loss": distill_loss.detach() if distill_loss is not None else None,
-				"distill_ce_loss": distill_ce_loss.detach() if distill_ce_loss is not None else None}
 
 	def fill_inputs_with_zs(self, zs, inputs):
 		for key in zs:
