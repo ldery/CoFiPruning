@@ -70,12 +70,11 @@ class My_Trainer(Trainer):
 			teacher_model=None,
 			**kwargs,
 	):
-
 		Trainer.__init__(self, model, args, data_collator, train_dataset,
 						 eval_dataset, tokenizer, model_init, compute_metrics, **kwargs)
 
 		self.additional_args = additional_args
-
+		
 		self.l0_module = l0_module
 		self.prepruning_finetune_steps = 100
 		self.start_prune = False
@@ -95,7 +94,7 @@ class My_Trainer(Trainer):
 		if self.teacher_model is not None:
 			self.teacher_model = self.teacher_model.to(self.args.device)
 
-		log_level = args.get_process_log_level()
+		log_level = logging.CRITICAL #args.get_process_log_level()
 		logging.set_verbosity(log_level)
 		logger.setLevel(log_level)
 		
@@ -104,12 +103,27 @@ class My_Trainer(Trainer):
 		self.base_zs = {}
 		for k, v in base_zs.items():
 			v_ = v.detach()
-			v_.zero_().fill_(0.5)
+			fill_val = 0.5
+			if k == 'mlp_z':
+				fill_val = 0.25
+			elif k == 'head_z':
+				fill_val = 1.0/12
+			v_.zero_().fill_(fill_val)
 			v_.requires_grad = False
 			self.base_zs[k] = v_
 		
 		self.train_batcher = iter(self.get_train_dataloader())
 		self.val_batcher = iter(self.get_eval_dataloader())
+	
+	def gen_random_mask(self, arch_comp_keys):
+		mask = {}
+		for k, v in self.base_zs.items():
+			if k in arch_comp_keys:
+# 				assert (v == 0.5).all(), 'There should be equal odds of unit being turned on or off'
+				mask[k] = torch.bernoulli(v)
+			else:
+				mask[k] = torch.ones_like(v)
+		return mask
 
 	def get_next_batch(self, is_train=True):
 		this_batcher = self.train_batcher if is_train else self.val_batcher
@@ -130,16 +144,16 @@ class My_Trainer(Trainer):
 		embeds = self.model(**inputs)['pooler_output']
 		return embeds, inputs.get("labels")
 
-
 	def train(self):
 		# TODO[ldery] - go from hard-coded value
-		n_total_masks = 1 #10000
+		n_total_masks = 5000 #10000
 		mask_embeddings_map = []
 		arch_comp_keys = ['head_z', 'mlp_z']
 
 		self.model.eval()
 		not_random_ = True
 		if not_random_:
+			all_results = defaultdict(list)
 			for mask_ in tqdm(range(n_total_masks)):
 				with torch.no_grad():
 					# Get a batch of data
@@ -147,15 +161,16 @@ class My_Trainer(Trainer):
 					val_inputs = self.get_next_batch(is_train=False)
 					cur_mask = self.gen_random_mask(arch_comp_keys)
 
-					self.fill_inputs_with_zs(cur_mask, val_inputs)
-					val_inputs = self._prepare_inputs(val_inputs)
-					val_embeds = self.model(**val_inputs)['pooler_output']
+					tr_outputs = self.run_through_model(cur_mask, tr_inputs)
+					val_outputs = self.run_through_model(cur_mask, val_inputs)
 
-					pair_ = (cur_mask, (self.run_through_model(cur_mask, tr_inputs), self.run_through_model(cur_mask, val_inputs)))
-					mask_embeddings_map.append(pair_)
+				attn_scores = self.get_attnhead_scores(cur_mask, tr_outputs, val_outputs)
+				all_results['attn_scores'].append(attn_scores)
 
-			# mask_embeddings_map => {mask : # [(tr_x, tr_y), (val_x, val_y)]}
-			self.best_zs = self.get_best_mask(mask_embeddings_map, arch_comp_keys)
+				mlp_scores = self.get_mlp_scores(cur_mask, tr_outputs, val_outputs)
+				all_results['mlp_scores'].append(mlp_scores)
+
+			self.best_zs = self.get_best_mask(all_results, arch_comp_keys)
 		else:
 			self.best_zs = self.gen_random_mask(arch_comp_keys) #self.head_choices_to_masks(best_heads)
 			best_heads = [(i_, np.random.choice(12)) for i_ in range(12)]
@@ -168,66 +183,61 @@ class My_Trainer(Trainer):
 				self.best_zs['mlp_z'][l] = 1.0
 			print(self.best_zs)
 
-	def get_best_mask(self, mask_embeddings_map, arch_comp_keys):
+	def get_best_mask(self, score_map, arch_comp_keys):
 		best_mask = None
 		for key in arch_comp_keys:
 			if key == 'head_z':
-				scores = self.get_attnhead_scores(mask_embeddings_map)
-				mean_, std_ = np.mean(scores, axis=1, keepdims=True), np.std(scores, axis=1, keepdims=True)
+				scores = np.array(score_map['attn_scores'])
+				print(key, scores.max())
+				scores[scores < 0] = np.NaN
+				mean_, std_ = np.nanmean(scores, axis=2, keepdims=True), np.nanstd(scores, axis=2, keepdims=True)
 				normalized_scores = (scores - mean_) / (std_ + 1e-8) # epsilon
+				normalized_scores = np.nanmean(normalized_scores, axis=0)
 				normalized_scores = normalized_scores[:, :, 0] - normalized_scores[:, :, 1]
 				best_heads = np.argmax(normalized_scores, axis=-1)
 			elif key == 'mlp_z':
-				scores = self.get_mlp_scores(mask_embeddings_map)
-				mean_, std_ = np.mean(scores, axis=1, keepdims=True), np.std(scores, axis=1, keepdims=True)
+				scores = np.array(score_map['mlp_scores'])
+				print(key, scores.max())
+				scores[scores < 0] = np.NaN
+				mean_, std_ = np.nanmean(scores, axis=1, keepdims=True), np.nanstd(scores, axis=1, keepdims=True)
 				normalized_scores = (scores - mean_) / (std_ + 1e-8) # epsilon
+				normalized_scores = np.nanmean(normalized_scores, axis=0)
 				normalized_scores = normalized_scores[:, 0] - normalized_scores[:, 1]
 				best_heads = np.argsort(normalized_scores)[:3] # 3 is hardcoded for now
-			pdb.set_trace()
+			print(key, best_heads)
 			best_mask = self.arch_choices_to_masks(best_heads, mask_to_update=best_mask, key=key)
-		print([best_mask[k] for k in arch_comp_keys])
 		return best_mask
 
-	def get_mlp_scores(self, mask_embeddings_map):
+	def get_mlp_scores(self, mask, tr_embeds, val_embeds):
 		def mlp_is_on(mlp_id, mask_dict):
 			return (mask_dict['mlp_z'][mlp_id]).item() == 1
 
 		delta_perfs = defaultdict(float)
 		mlp_scores = []
 		for l_ in range(self.nlayers):
-			deltas = []
-			on_embeds, off_embeds = self.separate_embeddings(mask_embeddings_map, partial(mlp_is_on, l_))
-			delta_perf = self.linear_fit_and_evaluate(on_embeds, off_embeds)
-			mlp_scores.append(delta_perf)
+			perf = self.linear_fit_and_evaluate(tr_embeds, val_embeds)
+			# decided whether on or off
+			on_score = perf if mlp_is_on(l_, mask) else -1.0
+			off_score = perf if on_score == -1 else -1.0
+			mlp_scores.append([on_score, off_score])
 		return np.array(mlp_scores)
 
-	def get_attnhead_scores(self, mask_embeddings_map):
+	def get_attnhead_scores(self, mask, tr_embeds, val_embeds):
 		def head_is_on(head_id, mask_dict):
 			return (mask_dict['head_z'][head_id[0], :, head_id[1], :, :]).item() == 1
 
 		delta_perfs = defaultdict(float)
 		head_scores = []
 		for l_ in range(self.nlayers):
-			deltas = []
+			scores = []
 			for h_ in range(self.nheads_per_layer):
 				# separate masks into those with head turned on and those with it turned off
-				on_embeds, off_embeds = self.separate_embeddings(mask_embeddings_map, partial(head_is_on, (l_, h_)))
-				delta_perf = self.linear_fit_and_evaluate(on_embeds, off_embeds)
-				deltas.append(delta_perf)
-			head_scores.append(deltas)
+				perf = self.linear_fit_and_evaluate(tr_embeds, val_embeds)
+				on_score = perf if head_is_on((l_, h_), mask) else -1.0
+				off_score = perf if on_score == -1 else -1.0
+				scores.append(([on_score, off_score]))
+			head_scores.append(scores)
 		return np.array(head_scores)
-
-	def separate_embeddings(self, mask_embeddings_map, check_activated):
-		on_embs = [[[], []], [[], []]] # [train(x, y), val(x, y)]
-		off_embs = deepcopy(on_embs)
-		for (mask_, embeds_) in mask_embeddings_map:
-			(tr_x, tr_y), (val_x, val_y) = embeds_
-			to_use = on_embs if check_activated(mask_) else off_embs
-			to_use[0][0].append(tr_x)
-			to_use[0][1].append(tr_y)
-			to_use[1][0].append(val_x)
-			to_use[1][1].append(val_y)
-		return on_embs, off_embs
 
 	def arch_choices_to_masks(self, choices, mask_to_update=None, key='head_z'):
 		def update_fn(choices, key, tensor_):
@@ -244,48 +254,36 @@ class My_Trainer(Trainer):
 		mask_to_update[key] = update_fn(choices, key, mask_to_update[key])
 		return mask_to_update
 
-	def gen_random_mask(self, arch_comp_keys):
-		mask = {}
-		for k, v in self.base_zs.items():
-			if k in arch_comp_keys:
-				assert (v == 0.5).all(), 'There should be equal odds of unit being turned on or off'
-				mask[k] = torch.bernoulli(v)
-			else:
-				mask[k] = torch.ones_like(v)
-		return mask
+	def linear_fit_and_evaluate(self, train_, test_):
 
-	def linear_fit_and_evaluate(self, on_embeds, off_embeds):
-		tr_on, tr_off = on_embeds[0], off_embeds[0]
-		eval_on, eval_off = on_embeds[1], off_embeds[1]
-		def fit_and_evaluate(train_, test_):
-			xs, ys = train_
-			xs, ys = torch.concat(xs), torch.concat(ys)
+		xs, ys = train_
+		test_x, test_y = test_
 
-			# Run N-GD Steps to learn linear classifier
-			linear_model = torch.nn.Sequential(nn.BatchNorm1d(xs.shape[-1]), nn.Linear(xs.shape[-1], self.num_labels))
-			linear_model.to(xs.device)
-			optim = Adam(linear_model.parameters(), lr=1e-2) # TODO [ldery] - ablate a reasonable learning rate.
-			print('iterating ... ')
-			for j_ in range(20): # TODO[ldery] - ablate the number of steps
-				optim.zero_grad()
-				logits_ = linear_model(xs).view(-1, self.num_labels)
-				loss_ = CrossEntropyLoss()(logits_, ys.view(-1))
-				loss_.backward()
-				optim.step()
-# 				if j_ % 9 == 0:
-				print(j_, loss_.item())
-			# Do the evaluation
-			linear_model.eval()
-			with torch.no_grad():
-				xs, ys = test_
-				xs, ys = torch.concat(xs), torch.concat(ys)
-				preds = linear_model(xs)
-			return self.compute_metrics(EvalPrediction(predictions=preds.cpu(), label_ids=ys.cpu()))['accuracy'] # We are assuming we are dealing with classification only for now
-
-		on_result = fit_and_evaluate(tr_on, eval_on) if len(tr_on[0]) > 0 else -1
-		off_result = fit_and_evaluate(tr_off, eval_off) if len(tr_off[0]) > 0 else -1
-		print(on_result, off_result)
-		return on_result, off_result
+		# Run N-GD Steps to learn linear classifier
+		linear_model = torch.nn.Sequential(
+			nn.BatchNorm1d(xs.shape[-1]), 
+			nn.Linear(xs.shape[-1], self.num_labels)
+		)
+		linear_model.to(xs.device)
+		optim = Adam(linear_model.parameters(), lr=2e-2) # TODO [ldery] - ablate a reasonable learning rate.
+		max_eval_acc = -1.0
+		num_iters = 20 # TODO[ldery] - ablate the number of steps
+		for j_ in range(num_iters): 
+			optim.zero_grad()
+			logits_ = linear_model(xs).view(-1, self.num_labels)
+			loss_ = CrossEntropyLoss()(logits_, ys.view(-1))
+			loss_.backward()
+			optim.step()
+			if (j_ % 5 == 0) or (j_ == (num_iters - 1)):
+				# Now do an eval step
+				linear_model.eval()
+				predictions = linear_model(test_x).argmax(axis=-1)
+				eval_accuracy = (predictions.eq(test_y) * 1.0).mean().item()
+				max_eval_acc = max(max_eval_acc, eval_accuracy)
+				linear_model.train()
+# 			print(j_, loss_.item(), eval_accuracy, max_eval_acc)
+# 		print(max_eval_acc)
+		return max_eval_acc
 
 
 	def save_model(self, output_dir: Optional[str] = None):
