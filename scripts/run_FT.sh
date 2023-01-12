@@ -46,7 +46,7 @@ pretrained_pruned_model=${4}
 learning_rate=$3
 scheduler_type=none
 output_dir=$pretrained_pruned_model/FT-lr${learning_rate}
-epochs=20
+epochs=50 #20
 batch_size=64
 
 

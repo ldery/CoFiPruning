@@ -104,10 +104,10 @@ class My_Trainer(Trainer):
 		for k, v in base_zs.items():
 			v_ = v.detach()
 			fill_val = 0.5
-			if k == 'mlp_z':
-				fill_val = 0.25
-			elif k == 'head_z':
-				fill_val = 1.0/12
+# 			if k == 'mlp_z':
+# 				fill_val = 0.25
+# 			elif k == 'head_z':
+# 				fill_val = 1.0/12
 			v_.zero_().fill_(fill_val)
 			v_.requires_grad = False
 			self.base_zs[k] = v_
@@ -119,7 +119,7 @@ class My_Trainer(Trainer):
 		mask = {}
 		for k, v in self.base_zs.items():
 			if k in arch_comp_keys:
-# 				assert (v == 0.5).all(), 'There should be equal odds of unit being turned on or off'
+				assert (v == 0.5).all(), 'There should be equal odds of unit being turned on or off'
 				mask[k] = torch.bernoulli(v)
 			else:
 				mask[k] = torch.ones_like(v)
@@ -146,7 +146,7 @@ class My_Trainer(Trainer):
 
 	def train(self):
 		# TODO[ldery] - go from hard-coded value
-		n_total_masks = 5000 #10000
+		n_total_masks = 8000 #10000
 		mask_embeddings_map = []
 		arch_comp_keys = ['head_z', 'mlp_z']
 
