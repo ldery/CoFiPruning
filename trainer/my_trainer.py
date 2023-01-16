@@ -6,6 +6,7 @@ import sys
 import time
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 from copy import deepcopy
+import pickle as pkl
 
 import numpy as np
 import torch
@@ -85,6 +86,7 @@ class My_Trainer(Trainer):
 		self.nlayers = self.l0_module.num_hidden_layers
 		self.nheads_per_layer =  self.l0_module.num_attention_heads
 		self.num_labels = model.num_labels
+		self.best_random_mask = None
 
 		self.lagrangian_optimizer = None
 
@@ -99,27 +101,23 @@ class My_Trainer(Trainer):
 		logger.setLevel(log_level)
 		
 		# Setup for our method
+		self.arch_comp_keys = ['head_z', 'mlp_z', 'intermediate_z']
 		base_zs = self.l0_module.forward(training=False)
 		self.base_zs = {}
 		for k, v in base_zs.items():
 			v_ = v.detach()
-			fill_val = 0.5
-# 			if k == 'mlp_z':
-# 				fill_val = 0.25
-# 			elif k == 'head_z':
-# 				fill_val = 1.0/12
+			fill_val = 0.5 if k in self.arch_comp_keys else 1.0
 			v_.zero_().fill_(fill_val)
 			v_.requires_grad = False
 			self.base_zs[k] = v_
 		
 		self.train_batcher = iter(self.get_train_dataloader())
 		self.val_batcher = iter(self.get_eval_dataloader())
-	
-	def gen_random_mask(self, arch_comp_keys):
+
+	def gen_random_mask(self):
 		mask = {}
 		for k, v in self.base_zs.items():
-			if k in arch_comp_keys:
-				assert (v == 0.5).all(), 'There should be equal odds of unit being turned on or off'
+			if k in self.arch_comp_keys:
 				mask[k] = torch.bernoulli(v)
 			else:
 				mask[k] = torch.ones_like(v)
@@ -143,116 +141,134 @@ class My_Trainer(Trainer):
 		inputs = self._prepare_inputs(inputs)
 		embeds = self.model(**inputs)['pooler_output']
 		return embeds, inputs.get("labels")
+	
+	def get_mask_perf(self, cur_mask):
+		with torch.no_grad():
+			# Get a batch of data
+			tr_inputs = self.get_next_batch(is_train=True)
+			val_inputs = self.get_next_batch(is_train=False)
+
+			tr_outputs = self.run_through_model(cur_mask, tr_inputs)
+			val_outputs = self.run_through_model(cur_mask, val_inputs)
+		return self.linear_fit_and_evaluate(tr_outputs, val_outputs)
+
+	def normalize_scores(self, scores_, type_='attn'):
+		scores = np.array(scores_)
+		scores[scores < 0] = np.NaN
+		mean_, std_ = np.nanmean(scores), np.nanstd(scores)
+		normalized_scores = (scores - mean_) / (std_ + 1e-8) # epsilon
+		normalized_scores = np.nanmean(normalized_scores, axis=0)
+		if (type_ == 'attn') or (type_ == 'intermed'):
+			normalized_scores = normalized_scores[:, :, 0] - normalized_scores[:, :, 1]
+		else:
+			normalized_scores = normalized_scores[:, 0] - normalized_scores[:, 1]
+
+		return normalized_scores
+	
+	def reset_base_zs(self, scores_dict):
+		mlp_scores = self.normalize_scores(scores_dict['mlp_scores'], type_='mlp')
+		attn_scores = self.normalize_scores(scores_dict['attn_scores'])
+		intermed_scores =  self.normalize_scores(scores_dict['intermed_scores'], type_='intermed')
+		attn_mask, mlp_mask = torch.tensor(attn_scores > 0).float(), torch.tensor(mlp_scores > 0).float()
+		intermed_mask = torch.tensor(intermed_scores > 0).float()
+		attn_occ, mlp_occ, intermed_occ = attn_mask.mean(), mlp_mask.mean(), intermed_mask.mean()
+		print('ATTN avg occ = {:.3f} | MLP avg occ = {:.3f} | Intermed avg occ = {:.3f}'.format(attn_occ, mlp_occ, intermed_occ))
+		self.base_zs['head_z'] = (attn_mask.unsqueeze(1).unsqueeze(-1).unsqueeze(-1)) * 0.5 # multiply by initial fillval
+		self.base_zs['mlp_z'] = mlp_mask * 0.5
+		self.base_zs['intermediate_z'] = (intermed_mask.unsqueeze(1).unsqueeze(1)) * 0.5
+		return {'mlp_z': mlp_occ, 'head_z': attn_occ, 'intermediate_z': intermed_occ}
+
+	def check_and_retrieve_past_runs(self):
+		scores_save_path = os.path.join(self.args.output_dir, 'module_perfs.pkl') 
+		if os.path.exists(scores_save_path):
+			print('Resetting Initial Based Mask')
+			scores_dict = pkl.load(open(scores_save_path, 'rb'))
+			self.best_random_mask = torch.load(os.path.join(self.args.output_dir, "best_random_mask.pt"))
+			return self.reset_base_zs(scores_dict)
+		return {'mlp_z': 1.0, 'head_z': 1.0, 'intermediate_z': 1.0}
+
+	def construct_module_scores(self, n_total_masks):
+		module_perfs = defaultdict(list) # Reset the module perfs
+		best_perf_so_far, best_random_mask = -1.0, None
+		for mask_ in tqdm(range(n_total_masks)):
+			cur_mask = self.gen_random_mask()
+			this_perf = self.get_mask_perf(cur_mask)
+			attn_scores = self.set_scores(cur_mask['head_z'].squeeze().unsqueeze(-1), this_perf)
+			module_perfs['attn_scores'].append(attn_scores)
+
+			mlp_scores = self.set_scores(cur_mask['mlp_z'].squeeze().unsqueeze(-1), this_perf)
+			module_perfs['mlp_scores'].append(mlp_scores)
+			
+			intermed_scores = self.set_scores(cur_mask['intermediate_z'].squeeze().unsqueeze(-1), this_perf)
+			module_perfs['intermed_scores'].append(intermed_scores)
+
+			if this_perf > best_perf_so_far:
+				best_perf_so_far = this_perf
+				best_random_mask = cur_mask
+		return best_perf_so_far, best_random_mask, module_perfs
 
 	def train(self):
 		# TODO[ldery] - go from hard-coded value
-		n_total_masks = 8000 #10000
+		n_total_masks = 1000 #8000 #10000
 		mask_embeddings_map = []
-		arch_comp_keys = ['head_z', 'mlp_z']
-
 		self.model.eval()
 		not_random_ = True
+		prev_occ_dict = self.check_and_retrieve_past_runs()
+		print('We achieved the following loaded occupancies')
+		print(' | '.join(['{} : {:.3f}'.format(k, v) for k, v in prev_occ_dict.items()]))
+# 		pdb.set_trace()
+# 		exit()
+		n_total_rounds = 5
 		if not_random_:
-			all_results = defaultdict(list)
-			for mask_ in tqdm(range(n_total_masks)):
-				with torch.no_grad():
-					# Get a batch of data
-					tr_inputs = self.get_next_batch(is_train=True)
-					val_inputs = self.get_next_batch(is_train=False)
-					cur_mask = self.gen_random_mask(arch_comp_keys)
+			initial_occupancy = calculate_parameters(self.model)
+			target_sparsity = 0.8
+			best_perf = -1
+			for round_ in range(n_total_rounds):
+				print('Starting Round : ', round_ + 1)
+				best_perf, best_random_mask, module_perfs = self.construct_module_scores(n_total_masks)
+				this_occ_dict = self.reset_base_zs(module_perfs)
+				assert all([occ <= prev_occ_dict[k] for k, occ in this_occ_dict.items()]), 'Occupancy cannot increase over time!'
+				# Caching for saving in case this is the last round
+				self.best_random_mask = best_random_mask
+				self.module_perfs = module_perfs
 
-					tr_outputs = self.run_through_model(cur_mask, tr_inputs)
-					val_outputs = self.run_through_model(cur_mask, val_inputs)
+				cur_best_mask = deepcopy(self.base_zs)
+				cur_best_mask['head_z'] *= 2.0
+				cur_best_mask['mlp_z'] *= 2.0
+				cur_best_mask['intermediate_z'] *= 2.0
+				our_perf = self.get_mask_perf(cur_best_mask)
+				print('Best Random Perf : {:.3f}. Our Perf : {:.3f}'.format(best_perf, our_perf))
+				# Break if we have stopped reducing the model size
+				if all([occ == prev_occ_dict[k] for k, occ in this_occ_dict.items()]):
+					print('We have not been able to reduce occupancy any further')
+					break
 
-				attn_scores = self.get_attnhead_scores(cur_mask, tr_outputs, val_outputs)
-				all_results['attn_scores'].append(attn_scores)
+				model_cpy = deepcopy(self.model)
+				prune_model_with_z(cur_best_mask, model_cpy)
+				cur_sparsity = 1.0 - calculate_parameters(model_cpy) / initial_occupancy
+				print('Current Sparsity = {:.3f}'.format(cur_sparsity))
+				del model_cpy
 
-				mlp_scores = self.get_mlp_scores(cur_mask, tr_outputs, val_outputs)
-				all_results['mlp_scores'].append(mlp_scores)
+				self.best_zs = cur_best_mask
+				prev_occ_dict = this_occ_dict
+				if cur_sparsity >= target_sparsity:
+					break
+# 		else:
+# 			self.best_zs = self.gen_random_mask(arch_comp_keys) #self.head_choices_to_masks(best_heads)
+# 			best_heads = [(i_, np.random.choice(12)) for i_ in range(12)]
+# 			self.best_zs['head_z'] = torch.zeros_like(self.best_zs['head_z'])
+# 			self.best_zs['mlp_z'] = torch.zeros_like(self.best_zs['mlp_z'])
+# 			for p_ in best_heads:
+# 				self.best_zs['head_z'][p_[0], :, p_[1], :, :] = 1.0
 
-			self.best_zs = self.get_best_mask(all_results, arch_comp_keys)
-		else:
-			self.best_zs = self.gen_random_mask(arch_comp_keys) #self.head_choices_to_masks(best_heads)
-			best_heads = [(i_, np.random.choice(12)) for i_ in range(12)]
-			self.best_zs['head_z'] = torch.zeros_like(self.best_zs['head_z'])
-			self.best_zs['mlp_z'] = torch.zeros_like(self.best_zs['mlp_z'])
-			for p_ in best_heads:
-				self.best_zs['head_z'][p_[0], :, p_[1], :, :] = 1.0
+# 			for l in np.random.choice(12, 3):
+# 				self.best_zs['mlp_z'][l] = 1.0
+# 			print(self.best_zs)
 
-			for l in np.random.choice(12, 3):
-				self.best_zs['mlp_z'][l] = 1.0
-			print(self.best_zs)
-
-	def get_best_mask(self, score_map, arch_comp_keys):
-		best_mask = None
-		for key in arch_comp_keys:
-			if key == 'head_z':
-				scores = np.array(score_map['attn_scores'])
-				print(key, scores.max())
-				scores[scores < 0] = np.NaN
-				mean_, std_ = np.nanmean(scores, axis=2, keepdims=True), np.nanstd(scores, axis=2, keepdims=True)
-				normalized_scores = (scores - mean_) / (std_ + 1e-8) # epsilon
-				normalized_scores = np.nanmean(normalized_scores, axis=0)
-				normalized_scores = normalized_scores[:, :, 0] - normalized_scores[:, :, 1]
-				best_heads = np.argmax(normalized_scores, axis=-1)
-			elif key == 'mlp_z':
-				scores = np.array(score_map['mlp_scores'])
-				print(key, scores.max())
-				scores[scores < 0] = np.NaN
-				mean_, std_ = np.nanmean(scores, axis=1, keepdims=True), np.nanstd(scores, axis=1, keepdims=True)
-				normalized_scores = (scores - mean_) / (std_ + 1e-8) # epsilon
-				normalized_scores = np.nanmean(normalized_scores, axis=0)
-				normalized_scores = normalized_scores[:, 0] - normalized_scores[:, 1]
-				best_heads = np.argsort(normalized_scores)[:3] # 3 is hardcoded for now
-			print(key, best_heads)
-			best_mask = self.arch_choices_to_masks(best_heads, mask_to_update=best_mask, key=key)
-		return best_mask
-
-	def get_mlp_scores(self, mask, tr_embeds, val_embeds):
-		def mlp_is_on(mlp_id, mask_dict):
-			return (mask_dict['mlp_z'][mlp_id]).item() == 1
-
-		delta_perfs = defaultdict(float)
-		mlp_scores = []
-		for l_ in range(self.nlayers):
-			perf = self.linear_fit_and_evaluate(tr_embeds, val_embeds)
-			# decided whether on or off
-			on_score = perf if mlp_is_on(l_, mask) else -1.0
-			off_score = perf if on_score == -1 else -1.0
-			mlp_scores.append([on_score, off_score])
-		return np.array(mlp_scores)
-
-	def get_attnhead_scores(self, mask, tr_embeds, val_embeds):
-		def head_is_on(head_id, mask_dict):
-			return (mask_dict['head_z'][head_id[0], :, head_id[1], :, :]).item() == 1
-
-		delta_perfs = defaultdict(float)
-		head_scores = []
-		for l_ in range(self.nlayers):
-			scores = []
-			for h_ in range(self.nheads_per_layer):
-				# separate masks into those with head turned on and those with it turned off
-				perf = self.linear_fit_and_evaluate(tr_embeds, val_embeds)
-				on_score = perf if head_is_on((l_, h_), mask) else -1.0
-				off_score = perf if on_score == -1 else -1.0
-				scores.append(([on_score, off_score]))
-			head_scores.append(scores)
-		return np.array(head_scores)
-
-	def arch_choices_to_masks(self, choices, mask_to_update=None, key='head_z'):
-		def update_fn(choices, key, tensor_):
-			tensor_.zero_()
-			if key == 'head_z':
-				for l, h_id in enumerate(choices):
-					tensor_[l, :, h_id, :, :] = 1.0
-			elif key == 'mlp_z':
-				tensor_[choices] = 1.0
-			return tensor_
-
-		if mask_to_update is None:
-			mask_to_update = {k: torch.ones_like(v) for k, v in self.base_zs.items()}
-		mask_to_update[key] = update_fn(choices, key, mask_to_update[key])
-		return mask_to_update
+	def set_scores(self, mask, perf):
+		on_scores = (mask * perf) + (mask - 1)
+		off_scores = (1 - mask) * perf - mask
+		return np.array(torch.cat([on_scores, off_scores], axis=-1))
 
 	def linear_fit_and_evaluate(self, train_, test_):
 
@@ -295,7 +311,9 @@ class My_Trainer(Trainer):
 		elif self.l0_module is not None:
 			zs = self.l0_module.forward(training=False)
 		torch.save(zs, os.path.join(output_dir, "zs.pt"))
-
+		if self.best_random_mask is not None:
+			torch.save(self.best_random_mask, os.path.join(output_dir, "best_random_mask.pt"))
+		pkl.dump(self.module_perfs, open(os.path.join(output_dir, "module_perfs.pkl"), 'wb'))
 		self.model.save_pretrained(output_dir)
 
 
