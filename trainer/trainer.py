@@ -110,6 +110,7 @@ class CoFiTrainer(Trainer):
 		self.teacher_model = teacher_model
 		if self.teacher_model is not None:
 			self.teacher_model = self.teacher_model.to(self.args.device)
+			print('Teacher Model Size : ', calculate_parameters(teacher_model))
 
 		log_level = args.get_process_log_level()
 		logging.set_verbosity(log_level)
@@ -244,6 +245,9 @@ class CoFiTrainer(Trainer):
 		if self.lagrangian_optimizer is not None:
 			self.lagrangian_optimizer.zero_grad()
 
+		print('We are turning off distillation')
+		self.teacher_model = None
+		
 		disable_tqdm = self.args.disable_tqdm or not self.is_local_process_zero()
 		train_pbar = trange(epochs_trained, int(
 			np.ceil(num_train_epochs)), desc="Epoch", disable=disable_tqdm)
@@ -266,7 +270,7 @@ class CoFiTrainer(Trainer):
 			epoch_pbar = tqdm(epoch_iterator, desc="Iteration",
 							  disable=disable_tqdm)
 			self.eval_counter.clear()
-			if epoch > 19: #(epoch / num_train_epochs) > 0.2:
+			if epoch > -1: # 19: #(epoch / num_train_epochs) > 0.2:
 				print('We are turning off distillation')
 				self.teacher_model = None
 
@@ -652,12 +656,13 @@ class CoFiTrainer(Trainer):
 		layer_loss = self.calculate_layer_distillation_loss(teacher_outputs, student_outputs, zs)
 		distill_loss = layer_loss
 
-		ce_distill_loss = F.kl_div(
-			input=F.log_softmax(
-				student_outputs[1] / self.additional_args.distill_temp, dim=-1), #! logits: [32,3]
-			target=F.softmax(
-				teacher_outputs[1] / self.additional_args.distill_temp, dim=-1), #! distill_temp: 2.0
-			reduction="batchmean") * (self.additional_args.distill_temp ** 2)
+		ce_distill_loss = torch.nn.MSELoss()(student_outputs['pooler_output'], teacher_outputs['pooler_output'])
+# 		ce_distill_loss = F.kl_div(
+# 			input=F.log_softmax(
+# 				student_outputs[1] / self.additional_args.distill_temp, dim=-1), #! logits: [32,3]
+# 			target=F.softmax(
+# 				teacher_outputs[1] / self.additional_args.distill_temp, dim=-1), #! distill_temp: 2.0
+# 			reduction="batchmean") * (self.additional_args.distill_temp ** 2)
 
 		loss = self.additional_args.distill_ce_loss_alpha * ce_distill_loss
 		if distill_loss  is not None:
@@ -691,9 +696,15 @@ class CoFiTrainer(Trainer):
 				teacher_inputs = {key: inputs[key]
 								  for key in teacher_inputs_keys if key in inputs}
 				self.shortens_inputs(teacher_inputs)
-				teacher_outputs = self.teacher_model(**teacher_inputs)
+				del teacher_inputs['labels']
+				teacher_outputs = self.teacher_model.bert(**teacher_inputs)
+
+# 				teacher_outputs = self.teacher_model(**teacher_inputs)
 			self.shortens_inputs(inputs)
-			student_outputs = model(**inputs) #! get the two outputs
+			del inputs['labels']
+			student_outputs = model.bert(**inputs) #! get the two outputs
+
+# 			student_outputs = model(**inputs) #! get the two outputs
 
 			zs = {key: inputs[key] for key in inputs if "_z" in key} #! extract the zs
 			distill_loss, distill_ce_loss, loss = self.calculate_distillation_loss(

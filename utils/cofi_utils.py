@@ -20,17 +20,21 @@ def load_model_with_zs(model_path, model_class, zs=None):
 	config_path = os.path.join(model_path, "config.json")
 	if os.path.exists(config_path):
 		config = AutoConfig.from_pretrained(model_path)
-	model = model_class.from_pretrained(model_path, config=config)
-	p = os.path.join(model_path, "pytorch_model.bin")
-	loaded_weights = torch.load(p, map_location="cpu")
+	
+	model = model_class(config)
 
-	model.load_state_dict(loaded_weights)
-	print(f"Load weights from {model_path}")
+# 	model = model_class.from_pretrained(model_path, config=config)
+# 	p = os.path.join(model_path, "pytorch_model.bin")
+# 	loaded_weights = torch.load(p, map_location="cpu")
+
+# 	model.load_state_dict(loaded_weights)
+# 	print(f"Load weights from {model_path}")
 
 	update_params(model, zs)
 	print(f"Model Size before pruning: {calculate_parameters(model)}")
 	prune_model_with_z(zs, model)
 	print(f"Model Size after pruning: {calculate_parameters(model)}")
+
 # 	import pdb
 	with torch.no_grad():
 		for k, v in model.named_parameters():

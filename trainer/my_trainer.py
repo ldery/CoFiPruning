@@ -55,6 +55,22 @@ glue_tasks = {"cola": "matthews_correlation",
 		  "qnli_aug": "accuracy",
 		  "stsb_aug": "corr",}
 
+# TransRate Code
+def coding_rate(Z, eps=1e-4):
+	n, d = Z.shape
+	eye = torch.eye(d).to(Z.device)
+	(_, rate)= torch.linalg.slogdet((eye +  (1.0/(n * eps)) * (Z.T @ Z)))
+	return 0.5 * rate
+
+def transRate(Z, y, eps=1e-4):
+	Z = Z - torch.mean(Z, axis=0, keepdims=True)
+	RZ = coding_rate(Z)
+	RZY = 0
+	K = int(y.max() + 1)
+	for i in range(K):
+		RZY += coding_rate( Z[(y == i ).flatten()])
+	return (RZ - RZY/K).item()
+
 class My_Trainer(Trainer):
 	def __init__(
 			self,
@@ -95,13 +111,14 @@ class My_Trainer(Trainer):
 		self.teacher_model = teacher_model
 		if self.teacher_model is not None:
 			self.teacher_model = self.teacher_model.to(self.args.device)
+			self.teacher_model.eval()
 
 		log_level = logging.CRITICAL #args.get_process_log_level()
 		logging.set_verbosity(log_level)
 		logger.setLevel(log_level)
 		
 		# Setup for our method
-		self.arch_comp_keys = ['head_z', 'mlp_z', 'intermediate_z']
+		self.arch_comp_keys = ['head_z', 'mlp_z', 'intermediate_z', 'hidden_z']
 		base_zs = self.l0_module.forward(training=False)
 		self.base_zs = {}
 		for k, v in base_zs.items():
@@ -111,8 +128,10 @@ class My_Trainer(Trainer):
 			v_.requires_grad = False
 			self.base_zs[k] = v_
 		
+		self.acceptable_sparsity_delta = 0.02
 		self.train_batcher = iter(self.get_train_dataloader())
 		self.val_batcher = iter(self.get_eval_dataloader())
+		self.fitness_strategy = 'transRate' # 'embedding_cosine' # 'linear_fit' #  
 
 	def gen_random_mask(self):
 		mask = {}
@@ -143,14 +162,35 @@ class My_Trainer(Trainer):
 		return embeds, inputs.get("labels")
 	
 	def get_mask_perf(self, cur_mask):
-		with torch.no_grad():
-			# Get a batch of data
-			tr_inputs = self.get_next_batch(is_train=True)
-			val_inputs = self.get_next_batch(is_train=False)
+		if self.fitness_strategy == 'linear_fit':
+			with torch.no_grad():
+				# Get a batch of data
+				tr_inputs = self.get_next_batch(is_train=True)
+				val_inputs = self.get_next_batch(is_train=False)
 
-			tr_outputs = self.run_through_model(cur_mask, tr_inputs)
-			val_outputs = self.run_through_model(cur_mask, val_inputs)
-		return self.linear_fit_and_evaluate(tr_outputs, val_outputs)
+				tr_outputs = self.run_through_model(cur_mask, tr_inputs)
+				val_outputs = self.run_through_model(cur_mask, val_inputs)
+			return self.linear_fit_and_evaluate(tr_outputs, val_outputs)
+		elif self.fitness_strategy == 'embedding_cosine':
+			assert self.teacher_model is not None, 'To use this strategy the teacher must be available'
+			with torch.no_grad():
+				tr_inputs = self.get_next_batch(is_train=True)
+				original_embeds = self.teacher_model(** self._prepare_inputs(tr_inputs))['pooler_output']
+				masked_embeds = self.run_through_model(cur_mask, tr_inputs)[0]
+				cos_scores = nn.CosineSimilarity(dim=-1, eps=1e-6)(masked_embeds, original_embeds) + 1.0
+			return cos_scores.mean().item()
+		elif self.fitness_strategy == 'transRate':
+			with torch.no_grad():
+				# Get a batch of data
+				tr_inputs = self.get_next_batch(is_train=True)
+				val_inputs = self.get_next_batch(is_train=False)
+
+				tr_outputs = self.run_through_model(cur_mask, tr_inputs)
+				val_outputs = self.run_through_model(cur_mask, val_inputs)
+
+				Z, y = torch.concat([tr_outputs[0], val_outputs[0]]), torch.concat([tr_outputs[1], val_outputs[1]])
+				transrate = transRate(Z, y)
+				return transrate
 
 	def normalize_scores(self, scores_, type_='attn'):
 		scores = np.array(scores_)
@@ -162,21 +202,29 @@ class My_Trainer(Trainer):
 			normalized_scores = normalized_scores[:, :, 0] - normalized_scores[:, :, 1]
 		else:
 			normalized_scores = normalized_scores[:, 0] - normalized_scores[:, 1]
-
 		return normalized_scores
-	
+
+	def scores_to_mask(self, scores):
+		threshold = np.nanquantile(scores, 0.1) # TODO [0.25 quantile is hard-coded]
+		return torch.tensor(scores > threshold).float()
+
 	def reset_base_zs(self, scores_dict):
 		mlp_scores = self.normalize_scores(scores_dict['mlp_scores'], type_='mlp')
 		attn_scores = self.normalize_scores(scores_dict['attn_scores'])
 		intermed_scores =  self.normalize_scores(scores_dict['intermed_scores'], type_='intermed')
-		attn_mask, mlp_mask = torch.tensor(attn_scores > 0).float(), torch.tensor(mlp_scores > 0).float()
-		intermed_mask = torch.tensor(intermed_scores > 0).float()
-		attn_occ, mlp_occ, intermed_occ = attn_mask.mean(), mlp_mask.mean(), intermed_mask.mean()
-		print('ATTN avg occ = {:.3f} | MLP avg occ = {:.3f} | Intermed avg occ = {:.3f}'.format(attn_occ, mlp_occ, intermed_occ))
+		hidden_scores = self.normalize_scores(scores_dict['hidden_scores'], type_='hidden')
+
+		attn_mask, mlp_mask = self.scores_to_mask(attn_scores), self.scores_to_mask(mlp_scores)
+		intermed_mask, hidden_mask = self.scores_to_mask(intermed_scores), self.scores_to_mask(hidden_scores)
+
+		attn_occ, mlp_occ, intermed_occ, hidden_occ = attn_mask.mean(), mlp_mask.mean(), intermed_mask.mean(), hidden_mask.mean()
+
 		self.base_zs['head_z'] = (attn_mask.unsqueeze(1).unsqueeze(-1).unsqueeze(-1)) * 0.5 # multiply by initial fillval
 		self.base_zs['mlp_z'] = mlp_mask * 0.5
 		self.base_zs['intermediate_z'] = (intermed_mask.unsqueeze(1).unsqueeze(1)) * 0.5
-		return {'mlp_z': mlp_occ, 'head_z': attn_occ, 'intermediate_z': intermed_occ}
+		self.base_zs['hidden_z'] = hidden_mask * 0.5
+
+		return {'mlp_z': mlp_occ, 'head_z': attn_occ, 'intermediate_z': intermed_occ, 'hidden_z': hidden_occ}
 
 	def check_and_retrieve_past_runs(self):
 		scores_save_path = os.path.join(self.args.output_dir, 'module_perfs.pkl') 
@@ -185,7 +233,7 @@ class My_Trainer(Trainer):
 			scores_dict = pkl.load(open(scores_save_path, 'rb'))
 			self.best_random_mask = torch.load(os.path.join(self.args.output_dir, "best_random_mask.pt"))
 			return self.reset_base_zs(scores_dict)
-		return {'mlp_z': 1.0, 'head_z': 1.0, 'intermediate_z': 1.0}
+		return {'mlp_z': 1.0, 'head_z': 1.0, 'intermediate_z': 1.0, 'hidden_z': 1.0}
 
 	def construct_module_scores(self, n_total_masks):
 		module_perfs = defaultdict(list) # Reset the module perfs
@@ -202,6 +250,9 @@ class My_Trainer(Trainer):
 			intermed_scores = self.set_scores(cur_mask['intermediate_z'].squeeze().unsqueeze(-1), this_perf)
 			module_perfs['intermed_scores'].append(intermed_scores)
 
+			hidden_scores = self.set_scores(cur_mask['hidden_z'].squeeze().unsqueeze(-1), this_perf)
+			module_perfs['hidden_scores'].append(hidden_scores)
+
 			if this_perf > best_perf_so_far:
 				best_perf_so_far = this_perf
 				best_random_mask = cur_mask
@@ -209,50 +260,50 @@ class My_Trainer(Trainer):
 
 	def train(self):
 		# TODO[ldery] - go from hard-coded value
-		n_total_masks = 1000 #8000 #10000
+		n_total_masks = 500
 		mask_embeddings_map = []
 		self.model.eval()
 		not_random_ = True
 		prev_occ_dict = self.check_and_retrieve_past_runs()
 		print('We achieved the following loaded occupancies')
-		print(' | '.join(['{} : {:.3f}'.format(k, v) for k, v in prev_occ_dict.items()]))
-# 		pdb.set_trace()
-# 		exit()
-		n_total_rounds = 5
+		print(' | '.join(['{}-occupancy : {:.3f}'.format(k, v) for k, v in prev_occ_dict.items()]))
 		if not_random_:
 			initial_occupancy = calculate_parameters(self.model)
 			target_sparsity = 0.8
 			best_perf = -1
-			for round_ in range(n_total_rounds):
-				print('Starting Round : ', round_ + 1)
+			round_, max_rounds = 0, 10
+			while round_ < max_rounds:
+				round_ += 1
+				print('Starting Round : ', round_)
 				best_perf, best_random_mask, module_perfs = self.construct_module_scores(n_total_masks)
 				this_occ_dict = self.reset_base_zs(module_perfs)
 				assert all([occ <= prev_occ_dict[k] for k, occ in this_occ_dict.items()]), 'Occupancy cannot increase over time!'
+				print('\t', ' | '.join(['{}-occupancy : {:.3f}'.format(k, v) for k, v in this_occ_dict.items()]))
+				
+				# Get the best mask at the moment
+				cur_best_mask = deepcopy(self.base_zs)
+				for k in self.arch_comp_keys:
+					cur_best_mask[k] *= 2.0
+
+				our_perf = self.get_mask_perf(cur_best_mask)
+				print('\t', 'Best Random Perf : {:.3f}. Our Perf : {:.3f}'.format(best_perf, our_perf))
+
 				# Caching for saving in case this is the last round
 				self.best_random_mask = best_random_mask
 				self.module_perfs = module_perfs
-
-				cur_best_mask = deepcopy(self.base_zs)
-				cur_best_mask['head_z'] *= 2.0
-				cur_best_mask['mlp_z'] *= 2.0
-				cur_best_mask['intermediate_z'] *= 2.0
-				our_perf = self.get_mask_perf(cur_best_mask)
-				print('Best Random Perf : {:.3f}. Our Perf : {:.3f}'.format(best_perf, our_perf))
-				# Break if we have stopped reducing the model size
-				if all([occ == prev_occ_dict[k] for k, occ in this_occ_dict.items()]):
-					print('We have not been able to reduce occupancy any further')
-					break
-
-				model_cpy = deepcopy(self.model)
-				prune_model_with_z(cur_best_mask, model_cpy)
-				cur_sparsity = 1.0 - calculate_parameters(model_cpy) / initial_occupancy
-				print('Current Sparsity = {:.3f}'.format(cur_sparsity))
-				del model_cpy
-
 				self.best_zs = cur_best_mask
-				prev_occ_dict = this_occ_dict
-				if cur_sparsity >= target_sparsity:
+
+				cur_sparsity = self.calculate_model_sparsity(cur_best_mask, initial_occupancy)
+				print('\t', 'Current Sparsity Level : {:.3f}'.format(cur_sparsity))
+				if abs(cur_sparsity - target_sparsity) < self.acceptable_sparsity_delta:
 					break
+
+				if cur_sparsity > target_sparsity:
+					print('\t', 'We overshot. Post Hoc Fix with Module Perfs Recommended')
+					break
+
+				prev_occ_dict = this_occ_dict
+
 # 		else:
 # 			self.best_zs = self.gen_random_mask(arch_comp_keys) #self.head_choices_to_masks(best_heads)
 # 			best_heads = [(i_, np.random.choice(12)) for i_ in range(12)]
@@ -265,21 +316,31 @@ class My_Trainer(Trainer):
 # 				self.best_zs['mlp_z'][l] = 1.0
 # 			print(self.best_zs)
 
+	def calculate_model_sparsity(self, mask, initial_occupancy):
+		model_cpy = deepcopy(self.model)
+		prune_model_with_z(mask, model_cpy)
+		param_sparsity = 1.0 - calculate_parameters(model_cpy) / initial_occupancy
+		del model_cpy
+		return param_sparsity
+
+
 	def set_scores(self, mask, perf):
 		on_scores = (mask * perf) + (mask - 1)
 		off_scores = (1 - mask) * perf - mask
 		return np.array(torch.cat([on_scores, off_scores], axis=-1))
 
-	def linear_fit_and_evaluate(self, train_, test_):
 
+	def linear_fit_and_evaluate(self, train_, test_):
 		xs, ys = train_
 		test_x, test_y = test_
 
+		# TODO[ldery] - test out simple linear model with 5e-3
 		# Run N-GD Steps to learn linear classifier
 		linear_model = torch.nn.Sequential(
 			nn.BatchNorm1d(xs.shape[-1]), 
 			nn.Linear(xs.shape[-1], self.num_labels)
 		)
+# 		linear_model = nn.Linear(xs.shape[-1], self.num_labels)
 		linear_model.to(xs.device)
 		optim = Adam(linear_model.parameters(), lr=2e-2) # TODO [ldery] - ablate a reasonable learning rate.
 		max_eval_acc = -1.0
@@ -299,6 +360,7 @@ class My_Trainer(Trainer):
 				linear_model.train()
 # 			print(j_, loss_.item(), eval_accuracy, max_eval_acc)
 # 		print(max_eval_acc)
+# 		print('---'*30)
 		return max_eval_acc
 
 

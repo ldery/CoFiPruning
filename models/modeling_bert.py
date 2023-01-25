@@ -41,7 +41,6 @@ class CoFiLayerNorm(torch.nn.LayerNorm):
 		else:
 			output = F.layer_norm(
 				input, self.normalized_shape, self.weight, self.bias, self.eps)
-# 		print('Info : ', (input.mean().item(), output.mean().item()), (input.std().item(), output.std().item()), '\n')
 		return output
 
 class CoFiBertForSequenceClassification(BertForSequenceClassification):
