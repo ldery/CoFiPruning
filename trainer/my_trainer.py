@@ -164,19 +164,9 @@ class My_Trainer(Trainer):
 	def get_mask_perf(self, cur_mask):
 		if self.fitness_strategy == 'linear_fit':
 			with torch.no_grad():
-# 				# Get a batch of data
-# 				cur_mask['mlp_z'].fill_(1.0)
-# 				cur_mask['mlp_z'][-1] = 0
-
 				tr_inputs = self.get_next_batch(is_train=True)
 				val_inputs = self.get_next_batch(is_train=False)
 				tr_outputs = self.run_through_model(cur_mask, tr_inputs)
-# 				new_mask = self.gen_random_mask()
-# 				for k, v in new_mask.items():
-# 					v.fill_(1.0)
-# 				og_outputs = self.run_through_model(new_mask, tr_inputs)
-# 				# Do the comparisons we want here
-# 				pdb.set_trace()
 				val_outputs = self.run_through_model(cur_mask, val_inputs)
 			return self.linear_fit_and_evaluate(tr_outputs, val_outputs)
 		elif self.fitness_strategy == 'embedding_cosine':
@@ -200,13 +190,13 @@ class My_Trainer(Trainer):
 				transrate = transRate(Z, y)
 				return transrate
 
-	def normalize_scores(self, scores_, type_='attn'):
+	def normalize_scores(self, scores_, type_='head_z'):
 		scores = np.array(scores_)
 		scores[scores < 0] = np.NaN
 		mean_, std_ = np.nanmean(scores), np.nanstd(scores)
 		normalized_scores = (scores - mean_) / (std_ + 1e-8) # epsilon
 		normalized_scores = np.nanmean(normalized_scores, axis=0)
-		if (type_ == 'attn') or (type_ == 'intermed'):
+		if (type_ == 'head_z') or (type_ == 'intermediate_z'):
 			normalized_scores = normalized_scores[:, :, 0] - normalized_scores[:, :, 1]
 		else:
 			normalized_scores = normalized_scores[:, 0] - normalized_scores[:, 1]
@@ -217,24 +207,22 @@ class My_Trainer(Trainer):
 		return torch.tensor(scores > threshold).float()
 
 	def reset_base_zs(self, scores_dict):
-		mlp_scores = self.normalize_scores(scores_dict['mlp_scores'], type_='mlp')
-		attn_scores = self.normalize_scores(scores_dict['attn_scores'])
-		intermed_scores =  self.normalize_scores(scores_dict['intermed_scores'], type_='intermed')
-# 		hidden_scores = self.normalize_scores(scores_dict['hidden_scores'], type_='hidden')
+		occupancy_dict = {}
+		for key in self.arch_comp_keys:
+			this_scores = self.normalize_scores(scores_dict[key], type_=key)
+			this_mask = self.scores_to_mask(this_scores)
+			this_occ = this_mask.mean()
+			if key == 'head_z':
+				self.base_zs[key] = (this_mask.unsqueeze(1).unsqueeze(-1).unsqueeze(-1)) * 0.5 
+			elif key == 'mlp_z':
+				self.base_zs[key] = this_mask * 0.5
+			elif key == 'intermediate_z':
+				self.base_zs[key] = (this_mask.unsqueeze(1).unsqueeze(1)) * 0.5
+			else:
+				assert False, 'Invalid key present'
+			occupancy_dict[key] = this_occ
 
-		attn_mask, mlp_mask = self.scores_to_mask(attn_scores), self.scores_to_mask(mlp_scores)
-		intermed_mask = self.scores_to_mask(intermed_scores)
-# 		hidden_mask = self.scores_to_mask(hidden_scores)
-
-		attn_occ, mlp_occ, intermed_occ = attn_mask.mean(), mlp_mask.mean(), intermed_mask.mean()
-# 		hidden_occ = hidden_mask.mean()
-
-		self.base_zs['head_z'] = (attn_mask.unsqueeze(1).unsqueeze(-1).unsqueeze(-1)) * 0.5 # multiply by initial fillval
-		self.base_zs['mlp_z'] = mlp_mask * 0.5
-		self.base_zs['intermediate_z'] = (intermed_mask.unsqueeze(1).unsqueeze(1)) * 0.5
-# 		self.base_zs['hidden_z'] = hidden_mask * 0.5
-
-		return {'mlp_z': mlp_occ, 'head_z': attn_occ, 'intermediate_z': intermed_occ} #, 'hidden_z': hidden_occ}
+		return occupancy_dict
 
 	def check_and_retrieve_past_runs(self):
 		scores_save_path = os.path.join(self.args.output_dir, 'module_perfs.pkl') 
@@ -243,7 +231,7 @@ class My_Trainer(Trainer):
 			scores_dict = pkl.load(open(scores_save_path, 'rb'))
 			self.best_random_mask = torch.load(os.path.join(self.args.output_dir, "best_random_mask.pt"))
 			return self.reset_base_zs(scores_dict)
-		return {'mlp_z': 1.0, 'head_z': 1.0, 'intermediate_z': 1.0, 'hidden_z': 1.0}
+		return {k: 1.0 for k in self.arch_comp_keys}
 
 	def construct_module_scores(self, n_total_masks):
 		module_perfs = defaultdict(list) # Reset the module perfs
@@ -251,17 +239,11 @@ class My_Trainer(Trainer):
 		for mask_ in tqdm(range(n_total_masks)):
 			cur_mask = self.gen_random_mask()
 			this_perf = self.get_mask_perf(cur_mask)
-			attn_scores = self.set_scores(cur_mask['head_z'].squeeze().unsqueeze(-1), this_perf)
-			module_perfs['attn_scores'].append(attn_scores)
-
-			mlp_scores = self.set_scores(cur_mask['mlp_z'].squeeze().unsqueeze(-1), this_perf)
-			module_perfs['mlp_scores'].append(mlp_scores)
 			
-			intermed_scores = self.set_scores(cur_mask['intermediate_z'].squeeze().unsqueeze(-1), this_perf)
-			module_perfs['intermed_scores'].append(intermed_scores)
-
-			hidden_scores = self.set_scores(cur_mask['hidden_z'].squeeze().unsqueeze(-1), this_perf)
-			module_perfs['hidden_scores'].append(hidden_scores)
+			for key in self.arch_comp_keys:
+				sub_mask = cur_mask[key].squeeze().unsqueeze(-1)
+				this_scores =  self.set_scores(sub_mask, this_perf)
+				module_perfs[key].append(this_scores)
 
 			if this_perf > best_perf_so_far:
 				best_perf_so_far = this_perf
@@ -270,7 +252,7 @@ class My_Trainer(Trainer):
 
 	def train(self):
 		# TODO[ldery] - go from hard-coded value
-		n_total_masks = 100
+		n_total_masks = 100 # TODO [ldery] -- modify this to be a HP
 		mask_embeddings_map = []
 		self.model.eval()
 		not_random_ = True
@@ -279,9 +261,9 @@ class My_Trainer(Trainer):
 		print(' | '.join(['{}-occupancy : {:.3f}'.format(k, v) for k, v in prev_occ_dict.items()]))
 		if not_random_:
 			initial_occupancy = calculate_parameters(self.model)
-			target_sparsity = 0.8
+			target_sparsity = 0.8 # TODO [ldery] -- modify this to be a HP
 			best_perf = -1
-			round_, max_rounds = 0, 10
+			round_, max_rounds = 0, 10 # TODO [ldery] -- modify this to be a HP
 			while round_ < max_rounds:
 				round_ += 1
 				print('Starting Round : ', round_)
@@ -353,7 +335,7 @@ class My_Trainer(Trainer):
 		)
 		linear_model = nn.Linear(xs.shape[-1], self.num_labels)
 		linear_model.to(xs.device)
-		optim = Adam(linear_model.parameters(), lr=2e-2) # TODO [ldery] - ablate a reasonable learning rate.
+		optim = Adam(linear_model.parameters(), lr=2e-2) # TODO [ldery] -- modify this to be a HP
 		max_eval_acc = -1.0
 		num_iters = 20 # TODO[ldery] - ablate the number of steps
 		for j_ in range(num_iters): 
