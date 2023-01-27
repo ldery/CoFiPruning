@@ -118,7 +118,7 @@ class My_Trainer(Trainer):
 		logger.setLevel(log_level)
 		
 		# Setup for our method
-		self.arch_comp_keys = ['head_z', 'mlp_z', 'intermediate_z', 'hidden_z']
+		self.arch_comp_keys = ['head_z', 'mlp_z', 'intermediate_z'] #, 'hidden_z']
 		base_zs = self.l0_module.forward(training=False)
 		self.base_zs = {}
 		for k, v in base_zs.items():
@@ -131,7 +131,7 @@ class My_Trainer(Trainer):
 		self.acceptable_sparsity_delta = 0.02
 		self.train_batcher = iter(self.get_train_dataloader())
 		self.val_batcher = iter(self.get_eval_dataloader())
-		self.fitness_strategy = 'transRate' # 'embedding_cosine' # 'linear_fit' #  
+		self.fitness_strategy = 'linear_fit' #'transRate' # 'embedding_cosine' # 'linear_fit' #  
 
 	def gen_random_mask(self):
 		mask = {}
@@ -164,11 +164,19 @@ class My_Trainer(Trainer):
 	def get_mask_perf(self, cur_mask):
 		if self.fitness_strategy == 'linear_fit':
 			with torch.no_grad():
-				# Get a batch of data
+# 				# Get a batch of data
+# 				cur_mask['mlp_z'].fill_(1.0)
+# 				cur_mask['mlp_z'][-1] = 0
+
 				tr_inputs = self.get_next_batch(is_train=True)
 				val_inputs = self.get_next_batch(is_train=False)
-
 				tr_outputs = self.run_through_model(cur_mask, tr_inputs)
+# 				new_mask = self.gen_random_mask()
+# 				for k, v in new_mask.items():
+# 					v.fill_(1.0)
+# 				og_outputs = self.run_through_model(new_mask, tr_inputs)
+# 				# Do the comparisons we want here
+# 				pdb.set_trace()
 				val_outputs = self.run_through_model(cur_mask, val_inputs)
 			return self.linear_fit_and_evaluate(tr_outputs, val_outputs)
 		elif self.fitness_strategy == 'embedding_cosine':
@@ -212,19 +220,21 @@ class My_Trainer(Trainer):
 		mlp_scores = self.normalize_scores(scores_dict['mlp_scores'], type_='mlp')
 		attn_scores = self.normalize_scores(scores_dict['attn_scores'])
 		intermed_scores =  self.normalize_scores(scores_dict['intermed_scores'], type_='intermed')
-		hidden_scores = self.normalize_scores(scores_dict['hidden_scores'], type_='hidden')
+# 		hidden_scores = self.normalize_scores(scores_dict['hidden_scores'], type_='hidden')
 
 		attn_mask, mlp_mask = self.scores_to_mask(attn_scores), self.scores_to_mask(mlp_scores)
-		intermed_mask, hidden_mask = self.scores_to_mask(intermed_scores), self.scores_to_mask(hidden_scores)
+		intermed_mask = self.scores_to_mask(intermed_scores)
+# 		hidden_mask = self.scores_to_mask(hidden_scores)
 
-		attn_occ, mlp_occ, intermed_occ, hidden_occ = attn_mask.mean(), mlp_mask.mean(), intermed_mask.mean(), hidden_mask.mean()
+		attn_occ, mlp_occ, intermed_occ = attn_mask.mean(), mlp_mask.mean(), intermed_mask.mean()
+# 		hidden_occ = hidden_mask.mean()
 
 		self.base_zs['head_z'] = (attn_mask.unsqueeze(1).unsqueeze(-1).unsqueeze(-1)) * 0.5 # multiply by initial fillval
 		self.base_zs['mlp_z'] = mlp_mask * 0.5
 		self.base_zs['intermediate_z'] = (intermed_mask.unsqueeze(1).unsqueeze(1)) * 0.5
-		self.base_zs['hidden_z'] = hidden_mask * 0.5
+# 		self.base_zs['hidden_z'] = hidden_mask * 0.5
 
-		return {'mlp_z': mlp_occ, 'head_z': attn_occ, 'intermediate_z': intermed_occ, 'hidden_z': hidden_occ}
+		return {'mlp_z': mlp_occ, 'head_z': attn_occ, 'intermediate_z': intermed_occ} #, 'hidden_z': hidden_occ}
 
 	def check_and_retrieve_past_runs(self):
 		scores_save_path = os.path.join(self.args.output_dir, 'module_perfs.pkl') 
@@ -260,7 +270,7 @@ class My_Trainer(Trainer):
 
 	def train(self):
 		# TODO[ldery] - go from hard-coded value
-		n_total_masks = 500
+		n_total_masks = 100
 		mask_embeddings_map = []
 		self.model.eval()
 		not_random_ = True
@@ -276,6 +286,7 @@ class My_Trainer(Trainer):
 				round_ += 1
 				print('Starting Round : ', round_)
 				best_perf, best_random_mask, module_perfs = self.construct_module_scores(n_total_masks)
+				print('Best Perf : ', best_perf)
 				this_occ_dict = self.reset_base_zs(module_perfs)
 				assert all([occ <= prev_occ_dict[k] for k, occ in this_occ_dict.items()]), 'Occupancy cannot increase over time!'
 				print('\t', ' | '.join(['{}-occupancy : {:.3f}'.format(k, v) for k, v in this_occ_dict.items()]))
@@ -340,7 +351,7 @@ class My_Trainer(Trainer):
 			nn.BatchNorm1d(xs.shape[-1]), 
 			nn.Linear(xs.shape[-1], self.num_labels)
 		)
-# 		linear_model = nn.Linear(xs.shape[-1], self.num_labels)
+		linear_model = nn.Linear(xs.shape[-1], self.num_labels)
 		linear_model.to(xs.device)
 		optim = Adam(linear_model.parameters(), lr=2e-2) # TODO [ldery] - ablate a reasonable learning rate.
 		max_eval_acc = -1.0

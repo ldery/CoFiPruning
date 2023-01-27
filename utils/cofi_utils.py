@@ -23,28 +23,19 @@ def load_model_with_zs(model_path, model_class, zs=None):
 	
 	model = model_class(config)
 
-# 	model = model_class.from_pretrained(model_path, config=config)
-# 	p = os.path.join(model_path, "pytorch_model.bin")
-# 	loaded_weights = torch.load(p, map_location="cpu")
+	# TODO [ldery] - determine whether this should be turned off
+	model = model_class.from_pretrained(model_path, config=config)
+	p = os.path.join(model_path, "pytorch_model.bin")
+	loaded_weights = torch.load(p, map_location="cpu")
 
-# 	model.load_state_dict(loaded_weights)
-# 	print(f"Load weights from {model_path}")
+	model.load_state_dict(loaded_weights)
+	print(f"Load weights from {model_path}")
 
 	update_params(model, zs)
 	print(f"Model Size before pruning: {calculate_parameters(model)}")
 	prune_model_with_z(zs, model)
 	print(f"Model Size after pruning: {calculate_parameters(model)}")
 
-# 	import pdb
-	with torch.no_grad():
-		for k, v in model.named_parameters():
-			if 'LayerNorm' in k:
-# 				print(k, v.shape, v.mean().item(), v.std().item())
-				v.fill_(1.0)
-				if 'bias' in k:
-					v.zero_()
-# 				print('after', v.mean().item(), v.std().item())
-# 	pdb.set_trace()
 	return model
 
 def load_model(model_path, model_class, zs=None):

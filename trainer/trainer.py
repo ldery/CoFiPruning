@@ -111,6 +111,8 @@ class CoFiTrainer(Trainer):
 		if self.teacher_model is not None:
 			self.teacher_model = self.teacher_model.to(self.args.device)
 			print('Teacher Model Size : ', calculate_parameters(teacher_model))
+			self.cosine_loss = torch.nn.CosineEmbeddingLoss()
+			self.zs = load_zs(self.additional_args.pretrained_pruned_model)
 
 		log_level = args.get_process_log_level()
 		logging.set_verbosity(log_level)
@@ -245,9 +247,6 @@ class CoFiTrainer(Trainer):
 		if self.lagrangian_optimizer is not None:
 			self.lagrangian_optimizer.zero_grad()
 
-		print('We are turning off distillation')
-		self.teacher_model = None
-		
 		disable_tqdm = self.args.disable_tqdm or not self.is_local_process_zero()
 		train_pbar = trange(epochs_trained, int(
 			np.ceil(num_train_epochs)), desc="Epoch", disable=disable_tqdm)
@@ -270,9 +269,6 @@ class CoFiTrainer(Trainer):
 			epoch_pbar = tqdm(epoch_iterator, desc="Iteration",
 							  disable=disable_tqdm)
 			self.eval_counter.clear()
-			if epoch > -1: # 19: #(epoch / num_train_epochs) > 0.2:
-				print('We are turning off distillation')
-				self.teacher_model = None
 
 			for step, inputs in enumerate(epoch_iterator):
 				if (self.prepruning_finetune_steps > 0) and (self.global_step == self.prepruning_finetune_steps) and (self.l0_module is not None): #! before pruning, run 12272 steps
@@ -560,109 +556,32 @@ class CoFiTrainer(Trainer):
 
 		self.model.save_pretrained(output_dir)
 
-	def calculate_layer_distillation_loss(self, teacher_outputs, student_outputs, zs):
+	def calculate_layer_distillation_loss(self, teacher_outputs, student_outputs):
 		mse_loss = torch.nn.MSELoss(reduction="mean")
 		if self.additional_args.do_layer_distill: #! only do layer distill
-			mlp_z = None
-			head_layer_z = None
-			# logger.info(f"zs={zs}")
-			if "mlp_z" in zs:
-				mlp_z = zs["mlp_z"].detach().cpu()
-			if "head_layer_z" in zs:
-				head_layer_z = zs["head_layer_z"].detach().cpu()
+			total_loss, n_units = 0.0, 0.0
+			num_layers = self.zs['mlp_z'].shape[0]
 
-			teacher_layer_output = teacher_outputs[2][1:] #! hidden states, with a length of 12. Every has a shape of [32, 65, 768]
-			student_layer_output = student_outputs[2][1:] 
-
-			# distilliting existing layers
-			if self.additional_args.layer_distill_version == 2:
-				for layer_num, (t_layer_o, s_layer_o) in enumerate(zip(teacher_layer_output, student_layer_output)):
-					s_layer_o = self.model.layer_transformation(s_layer_o)
-					l = mse_loss(t_layer_o, s_layer_o)
-					if mlp_z is None or mlp_z[layer_num] > 0:
-						layer_loss += l
-
-			# distilling layers with a minimal distance
-			elif self.additional_args.layer_distill_version > 2:
-				l = []
-				if self.additional_args.layer_distill_version > 4:
-					specified_teacher_layers = [i for i in range(12)]
-					if self.additional_args.layer_distill_version ==5:
-						specified_teacher_layers = sorted(random.sample(specified_teacher_layers, 4))
-					elif self.additional_args.layer_distill_version ==6:
-						result_layers_T= []
-						skip_window = len(specified_teacher_layers)//4
-						for i in range(0, len(specified_teacher_layers), skip_window):
-							result_layers_T.append(random.sample(specified_teacher_layers[i:i+skip_window], 1)[0])
-						specified_teacher_layers = result_layers_T
-					specified_teacher_layers[0] = max(2, specified_teacher_layers[0])
-				else:
-					specified_teacher_layers = [2, 5, 8, 11]
-				# logger.info(f"sampled teacher layers: {specified_teacher_layers}")
-				transformed_s_layer_o = [self.model.layer_transformation(
-					s_layer_o) for s_layer_o in student_layer_output]
-				specified_teacher_layer_reps = [
-					teacher_layer_output[i] for i in specified_teacher_layers] #! teacher: 4x[32,113,768]
-
-				device = transformed_s_layer_o[0].device
-				for t_layer_o in specified_teacher_layer_reps:
-					for i, s_layer_o in enumerate(transformed_s_layer_o): #! student: 12x[32,113,768]
-						l.append(mse_loss(t_layer_o, s_layer_o))
-				layerwiseloss = torch.stack(l).reshape(
-					len(specified_teacher_layer_reps), len(student_layer_output)) #! [4,12]
-
-				existing_layers = None
-				if head_layer_z is not None:
-					existing_layers = head_layer_z != 0
-					existing_layers = existing_layers.to(layerwiseloss.device)
-
-				layer_loss = 0
-				#! no ordering restriction specified
-				if self.additional_args.layer_distill_version == 3:
-					alignment = torch.argmin(layerwiseloss, dim=1)
-				#! added the ordering restriction -> to choose the min loss in 4 student layers
-				elif self.additional_args.layer_distill_version in (3, 4, 5, 6):
-					last_aligned_layer = 12
-					alignment = []
-					for search_index in range(len(specified_teacher_layers)-1, -1, -1):
-						indexes = layerwiseloss[search_index].sort()[1]
-						if existing_layers is not None:
-							align = indexes[(
-								indexes < last_aligned_layer) & existing_layers]
-						else:
-							align = indexes[indexes < last_aligned_layer]
-						if len(align) > 0:
-							align = align[0]
-						else:
-							align = last_aligned_layer
-						alignment.append(align)
-						last_aligned_layer = align
-					alignment.reverse()
-					alignment = torch.tensor(alignment).to(device)
-				else:
-					logger.info(
-						f"{self.additional_args.layer_distill_version} version is not specified.")
-					sys.exit()
-
-				layerwise = torch.arange(len(specified_teacher_layers)).to(device)
-				layer_loss += layerwiseloss[layerwise, alignment].sum() #! layerwise: teacher (specified layers) / alignment: student (min loss layers) / layerwiseloss: [4,12]
-				if self.global_step % 100 == 0:
-					logger.info(f"v{self.additional_args.layer_distill_version} Global step: {self.global_step}, Alignment: " + str(alignment))
+			# Calculate the MLP losses
+			for l in range(num_layers):
+				if self.zs['mlp_z'][l]:
+					n_units += 1
+					# + 1 to discount the input
+					total_loss += mse_loss(student_outputs['hidden_states'][l + 1], teacher_outputs['hidden_states'][l + 1])  
+# 				if  self.zs['head_z'][l].sum():
+# 					n_units += 1
+# 					total_loss += mse_loss(teacher_outputs['attentions'][l] - student_outputs['attentions'][l + 1])
+			layer_loss = total_loss / n_units
 			return layer_loss
 		else:
 			return None
 
-	def calculate_distillation_loss(self, teacher_outputs, student_outputs, zs):
-		layer_loss = self.calculate_layer_distillation_loss(teacher_outputs, student_outputs, zs)
+	def calculate_distillation_loss(self, teacher_outputs, student_outputs):
+		layer_loss = self.calculate_layer_distillation_loss(teacher_outputs, student_outputs)
 		distill_loss = layer_loss
 
-		ce_distill_loss = torch.nn.MSELoss()(student_outputs['pooler_output'], teacher_outputs['pooler_output'])
-# 		ce_distill_loss = F.kl_div(
-# 			input=F.log_softmax(
-# 				student_outputs[1] / self.additional_args.distill_temp, dim=-1), #! logits: [32,3]
-# 			target=F.softmax(
-# 				teacher_outputs[1] / self.additional_args.distill_temp, dim=-1), #! distill_temp: 2.0
-# 			reduction="batchmean") * (self.additional_args.distill_temp ** 2)
+		y = torch.ones((student_outputs['pooler_output'].shape[0],)).to(student_outputs['pooler_output'].device)
+		ce_distill_loss = self.cosine_loss(student_outputs['pooler_output'], teacher_outputs['pooler_output'], y)
 
 		loss = self.additional_args.distill_ce_loss_alpha * ce_distill_loss
 		if distill_loss  is not None:
@@ -687,8 +606,10 @@ class CoFiTrainer(Trainer):
 		distill_loss = None
 		distill_ce_loss = None
 		supervised_loss = None
-
 		if self.teacher_model is not None:
+			labels = inputs['labels']
+			del inputs['labels']
+
 			with torch.no_grad():
 				# only retain inputs of certain keys
 				teacher_inputs_keys = ["input_ids", "attention_mask", "token_type_ids", "position_ids", "labels",
@@ -696,22 +617,18 @@ class CoFiTrainer(Trainer):
 				teacher_inputs = {key: inputs[key]
 								  for key in teacher_inputs_keys if key in inputs}
 				self.shortens_inputs(teacher_inputs)
-				del teacher_inputs['labels']
 				teacher_outputs = self.teacher_model.bert(**teacher_inputs)
 
-# 				teacher_outputs = self.teacher_model(**teacher_inputs)
 			self.shortens_inputs(inputs)
-			del inputs['labels']
+
 			student_outputs = model.bert(**inputs) #! get the two outputs
 
-# 			student_outputs = model(**inputs) #! get the two outputs
-
-			zs = {key: inputs[key] for key in inputs if "_z" in key} #! extract the zs
 			distill_loss, distill_ce_loss, loss = self.calculate_distillation_loss(
-				teacher_outputs, student_outputs, zs)
-			
-# 			supervised_loss = self.compute_loss(model, inputs)
-# 			loss += supervised_loss
+				teacher_outputs, student_outputs)
+
+			inputs['labels'] = labels
+			supervised_loss = self.compute_loss(model, inputs)
+			loss += supervised_loss
 		else:
 			loss = self.compute_loss(model, inputs)
 
