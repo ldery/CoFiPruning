@@ -123,17 +123,16 @@ class My_Trainer(Trainer):
 		self.base_zs = {}
 		for k, v in base_zs.items():
 			v_ = v.detach()
-			fill_val = 0.5 if k in self.arch_comp_keys else 1.0
-			v_.zero_().fill_(fill_val)
+			v_.zero_().fill_(1.0)
 			v_.requires_grad = False
 			self.base_zs[k] = v_
 		
 		self.acceptable_sparsity_delta = 0.02
 		self.train_batcher = iter(self.get_train_dataloader())
 		self.val_batcher = iter(self.get_eval_dataloader())
-		self.fitness_strategy = 'linear_fit' #'transRate' # 'embedding_cosine' # 'linear_fit' #  
+		self.fitness_strategy = 'transRate' # 'embedding_cosine' # 'linear_fit' #  
 
-	def gen_random_mask(self):
+	def gen_random_mask(self, layer_id):
 		mask = {}
 		for k, v in self.base_zs.items():
 			if k in self.arch_comp_keys:
@@ -160,16 +159,17 @@ class My_Trainer(Trainer):
 		inputs = self._prepare_inputs(inputs)
 		embeds = self.model(**inputs)['pooler_output']
 		return embeds, inputs.get("labels")
-	
-	def get_mask_perf(self, cur_mask):
-		if self.fitness_strategy == 'linear_fit':
+
+	def get_mask_perf(self, cur_mask, fitness_strategy=None):
+		fitness_strategy = fitness_strategy if fitness_strategy else self.fitness_strategy
+		if fitness_strategy == 'linear_fit':
 			with torch.no_grad():
 				tr_inputs = self.get_next_batch(is_train=True)
 				val_inputs = self.get_next_batch(is_train=False)
 				tr_outputs = self.run_through_model(cur_mask, tr_inputs)
 				val_outputs = self.run_through_model(cur_mask, val_inputs)
 			return self.linear_fit_and_evaluate(tr_outputs, val_outputs)
-		elif self.fitness_strategy == 'embedding_cosine':
+		elif fitness_strategy == 'embedding_cosine':
 			assert self.teacher_model is not None, 'To use this strategy the teacher must be available'
 			with torch.no_grad():
 				tr_inputs = self.get_next_batch(is_train=True)
@@ -177,7 +177,7 @@ class My_Trainer(Trainer):
 				masked_embeds = self.run_through_model(cur_mask, tr_inputs)[0]
 				cos_scores = nn.CosineSimilarity(dim=-1, eps=1e-6)(masked_embeds, original_embeds) + 1.0
 			return cos_scores.mean().item()
-		elif self.fitness_strategy == 'transRate':
+		elif fitness_strategy == 'transRate':
 			with torch.no_grad():
 				# Get a batch of data
 				tr_inputs = self.get_next_batch(is_train=True)
@@ -190,8 +190,7 @@ class My_Trainer(Trainer):
 				transrate = transRate(Z, y)
 				return transrate
 
-	def normalize_scores(self, scores_, type_='head_z'):
-		scores = np.array(scores_)
+	def normalize_scores(self, scores, type_='head_z'):
 		scores[scores < 0] = np.NaN
 		mean_, std_ = np.nanmean(scores), np.nanstd(scores)
 		normalized_scores = (scores - mean_) / (std_ + 1e-8) # epsilon
@@ -203,26 +202,42 @@ class My_Trainer(Trainer):
 		return normalized_scores
 
 	def scores_to_mask(self, scores):
-		threshold = np.nanquantile(scores, 0.1) # TODO [0.25 quantile is hard-coded]
+		if scores.size > 1:
+			threshold = np.nanquantile(scores, 0.3) # TODO [0.25 quantile is hard-coded]
+		else:
+			print('We need to set a zero threshold')
+			threshold = 0.0
 		return torch.tensor(scores > threshold).float()
 
-	def reset_base_zs(self, scores_dict):
+	def reset_base_zs(self, scores_dict, layer_ids):
 		occupancy_dict = {}
 		for key in self.arch_comp_keys:
-			this_scores = self.normalize_scores(scores_dict[key], type_=key)
+			this_scores = self.normalize_scores(np.array(scores_dict[key])[:, layer_ids], type_=key)
 			this_mask = self.scores_to_mask(this_scores)
 			this_occ = this_mask.mean()
 			if key == 'head_z':
-				self.base_zs[key] = (this_mask.unsqueeze(1).unsqueeze(-1).unsqueeze(-1)) * 0.5 
+				self.base_zs[key][layer_ids] = this_mask.unsqueeze(1).unsqueeze(-1).unsqueeze(-1) 
 			elif key == 'mlp_z':
-				self.base_zs[key] = this_mask * 0.5
+				self.base_zs[key][layer_ids] = this_mask
 			elif key == 'intermediate_z':
-				self.base_zs[key] = (this_mask.unsqueeze(1).unsqueeze(1)) * 0.5
+				self.base_zs[key][layer_ids] = this_mask.unsqueeze(1).unsqueeze(1)
 			else:
 				assert False, 'Invalid key present'
-			occupancy_dict[key] = this_occ
-
+			occupancy_dict[key] = this_occ.item()
 		return occupancy_dict
+	
+	def check_zs(self, layer_id):
+		for key in self.arch_comp_keys:
+			all_on = self.base_zs[key][:layer_id].sum() == (self.base_zs[key][:layer_id]).numel()
+			if not all_on:
+				pdb.set_trace()
+			assert all_on, 'There are lower layers that have been zero-ed out. This is not allowed'
+	
+	def prep_base_zs_layer(self, layer_id):
+		for k, v in self.base_zs.items():
+			if k in self.arch_comp_keys:
+				self.base_zs[k][[layer_id]] *= 0.5
+
 
 	def check_and_retrieve_past_runs(self):
 		scores_save_path = os.path.join(self.args.output_dir, 'module_perfs.pkl') 
@@ -230,14 +245,14 @@ class My_Trainer(Trainer):
 			print('Resetting Initial Based Mask')
 			scores_dict = pkl.load(open(scores_save_path, 'rb'))
 			self.best_random_mask = torch.load(os.path.join(self.args.output_dir, "best_random_mask.pt"))
-			return self.reset_base_zs(scores_dict)
+			return self.reset_base_zs(scores_dict, list(range(self.nlayers)))
 		return {k: 1.0 for k in self.arch_comp_keys}
 
-	def construct_module_scores(self, n_total_masks):
+	def construct_module_scores(self, n_total_masks, layer_id):
 		module_perfs = defaultdict(list) # Reset the module perfs
 		best_perf_so_far, best_random_mask = -1.0, None
 		for mask_ in tqdm(range(n_total_masks)):
-			cur_mask = self.gen_random_mask()
+			cur_mask = self.gen_random_mask(layer_id)
 			this_perf = self.get_mask_perf(cur_mask)
 			
 			for key in self.arch_comp_keys:
@@ -252,7 +267,7 @@ class My_Trainer(Trainer):
 
 	def train(self):
 		# TODO[ldery] - go from hard-coded value
-		n_total_masks = 100 # TODO [ldery] -- modify this to be a HP
+		n_total_masks = 50 # TODO [ldery] -- modify this to be a HP
 		mask_embeddings_map = []
 		self.model.eval()
 		not_random_ = True
@@ -262,52 +277,66 @@ class My_Trainer(Trainer):
 		if not_random_:
 			initial_occupancy = calculate_parameters(self.model)
 			target_sparsity = 0.8 # TODO [ldery] -- modify this to be a HP
-			best_perf = -1
-			round_, max_rounds = 0, 10 # TODO [ldery] -- modify this to be a HP
+			best_perf, total_time = -1, 0.0
+			round_, max_rounds = 0, 11 # TODO [ldery] -- modify this to be a HP
 			while round_ < max_rounds:
+				start_time = time.time()
+				print('Starting round : ', round_)
+				broke = False
+				for layer_id in list(range((self.nlayers - 1), -1, -1)):
+					print('Working on layer : ', layer_id)
+					self.prep_base_zs_layer(layer_id)
+
+					best_perf, best_random_mask, module_perfs = self.construct_module_scores(n_total_masks, layer_id)
+					print('Best Perf : ', best_perf)
+					this_occ_dict = self.reset_base_zs(module_perfs, [layer_id])
+					# TODO [ldery] -- do we want to think about some sort of distillation at this point ??
+
+	# 				assert all([occ <= prev_occ_dict[k] for k, occ in this_occ_dict.items()]), 'Occupancy cannot increase over time!'
+					print('\t', ' | '.join(['{}-occupancy : {:.3f}'.format(k, v) for k, v in this_occ_dict.items()]))
+					if round_ == 0:
+						# Do a sanity check
+						self.check_zs(layer_id)
+						
+
+					# Get the best mask at the moment
+					cur_best_mask = deepcopy(self.base_zs)
+					for k in self.arch_comp_keys:
+						cur_best_mask[k] = torch.clamp(cur_best_mask[k] * 2.0, max=1.0)
+
+
+					our_perf = self.get_mask_perf(cur_best_mask, fitness_strategy='linear_fit')
+					if self.fitness_strategy != 'linear_fit':
+						best_perf = self.get_mask_perf(best_random_mask, fitness_strategy='linear_fit')
+					print('\t', 'Best Random Perf : {:.3f}. Our Perf : {:.3f}'.format(best_perf, our_perf))
+
+					# Caching for saving in case this is the last round
+					self.best_random_mask = best_random_mask
+					self.module_perfs = module_perfs
+					self.best_zs = cur_best_mask
+
+					cur_sparsity = self.calculate_model_sparsity(cur_best_mask, initial_occupancy)
+					print('\t', 'Current Sparsity Level : {:.3f}'.format(cur_sparsity))
+					if abs(cur_sparsity - target_sparsity) < self.acceptable_sparsity_delta:
+						broke = True
+						break
+
+					if cur_sparsity > target_sparsity:
+						print('\t', 'We overshot. Post Hoc Fix with Module Perfs Recommended')
+						broke = True
+						break
+
+					prev_occ_dict = this_occ_dict
+
 				round_ += 1
-				print('Starting Round : ', round_)
-				best_perf, best_random_mask, module_perfs = self.construct_module_scores(n_total_masks)
-				print('Best Perf : ', best_perf)
-				this_occ_dict = self.reset_base_zs(module_perfs)
-				assert all([occ <= prev_occ_dict[k] for k, occ in this_occ_dict.items()]), 'Occupancy cannot increase over time!'
-				print('\t', ' | '.join(['{}-occupancy : {:.3f}'.format(k, v) for k, v in this_occ_dict.items()]))
-				
-				# Get the best mask at the moment
-				cur_best_mask = deepcopy(self.base_zs)
-				for k in self.arch_comp_keys:
-					cur_best_mask[k] *= 2.0
-
-				our_perf = self.get_mask_perf(cur_best_mask)
-				print('\t', 'Best Random Perf : {:.3f}. Our Perf : {:.3f}'.format(best_perf, our_perf))
-
-				# Caching for saving in case this is the last round
-				self.best_random_mask = best_random_mask
-				self.module_perfs = module_perfs
-				self.best_zs = cur_best_mask
-
-				cur_sparsity = self.calculate_model_sparsity(cur_best_mask, initial_occupancy)
-				print('\t', 'Current Sparsity Level : {:.3f}'.format(cur_sparsity))
-				if abs(cur_sparsity - target_sparsity) < self.acceptable_sparsity_delta:
+				delta = time.time() - start_time
+				total_time += delta
+				print('This round took : ', delta)
+				if broke:
 					break
 
-				if cur_sparsity > target_sparsity:
-					print('\t', 'We overshot. Post Hoc Fix with Module Perfs Recommended')
-					break
+			print('Time per round : ', total_time)
 
-				prev_occ_dict = this_occ_dict
-
-# 		else:
-# 			self.best_zs = self.gen_random_mask(arch_comp_keys) #self.head_choices_to_masks(best_heads)
-# 			best_heads = [(i_, np.random.choice(12)) for i_ in range(12)]
-# 			self.best_zs['head_z'] = torch.zeros_like(self.best_zs['head_z'])
-# 			self.best_zs['mlp_z'] = torch.zeros_like(self.best_zs['mlp_z'])
-# 			for p_ in best_heads:
-# 				self.best_zs['head_z'][p_[0], :, p_[1], :, :] = 1.0
-
-# 			for l in np.random.choice(12, 3):
-# 				self.best_zs['mlp_z'][l] = 1.0
-# 			print(self.best_zs)
 
 	def calculate_model_sparsity(self, mask, initial_occupancy):
 		model_cpy = deepcopy(self.model)
