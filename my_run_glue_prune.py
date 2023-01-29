@@ -371,7 +371,7 @@ def main():
 
 	# Need to do the fancy pertubative stuff here
 	training_args.per_device_eval_batch_size = 1024 # TODO [ldery] - hardcoded - need to fix
-	training_args.per_device_train_batch_size = 512 #training_args.per_device_eval_batch_size
+	training_args.per_device_train_batch_size = 256 #512 #training_args.per_device_eval_batch_size
 	trainer = My_Trainer(
 		model=model,
 		args=training_args,

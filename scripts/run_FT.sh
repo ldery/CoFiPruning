@@ -77,7 +77,8 @@ python3 $code_dir/run_glue_prune.py \
 	   --eval_steps ${eval_steps} \
 	   --evaluation_strategy steps \
 	   --distill_ce_loss_alpha 0.1 \
-	   --do_distill \
-	   --distillation_path $distillation_path \
 	   --seed ${seed} 2>&1 | tee $output_dir/all_log.txt
+
+# 	   --do_distill \
+# 	   --distillation_path $distillation_path \
 
