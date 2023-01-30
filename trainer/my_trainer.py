@@ -131,7 +131,7 @@ class My_Trainer(Trainer):
 		self.acceptable_sparsity_delta = 0.02
 		self.train_batcher = iter(self.get_train_dataloader())
 		self.val_batcher = iter(self.get_eval_dataloader())
-		self.fitness_strategy = 'transRate' # 'embedding_cosine' # 'linear_fit' #  
+		self.fitness_strategy = 'transRate' #  'embedding_cosine' #  'linear_fit' # 
 
 	def gen_random_mask(self):
 		mask = {}
@@ -209,13 +209,25 @@ class My_Trainer(Trainer):
 		return torch.tensor(scores > threshold).float()
 
 	def reset_base_zs(self, scores_dict):
-		mlp_scores = self.normalize_scores(scores_dict['mlp_scores'], type_='mlp')
-		attn_scores = self.normalize_scores(scores_dict['attn_scores'])
-		intermed_scores =  self.normalize_scores(scores_dict['intermed_scores'], type_='intermed')
-		hidden_scores = self.normalize_scores(scores_dict['hidden_scores'], type_='hidden')
+		aggregate = []
+		for k, scores in scores_dict.items():
+			scores = np.array(scores)
+			scores[scores < 0] = np.NaN
+			scores = np.nanmean(scores, axis=0)
+			if (k == 'attn_scores') or (k == 'intermed_scores'):
+				scores = scores[:, :, 0] - scores[:, :, 1]
+			else:
+				scores = scores[:, 0] - scores[:, 1]
+			scores_dict[k] = scores
+			aggregate.extend(scores.flatten())
+		aggregate = np.array(aggregate)
+		aggregate = aggregate[~np.isnan(aggregate)]
+		threshold = np.quantile(aggregate, 0.1) # Hardcoded fix
 
-		attn_mask, mlp_mask = self.scores_to_mask(attn_scores), self.scores_to_mask(mlp_scores)
-		intermed_mask, hidden_mask = self.scores_to_mask(intermed_scores), self.scores_to_mask(hidden_scores)
+		attn_mask = torch.tensor(scores_dict['attn_scores'] > threshold).float()
+		mlp_mask = torch.tensor(scores_dict['mlp_scores'] > threshold).float()
+		intermed_mask = torch.tensor(scores_dict['intermed_scores'] > threshold).float()
+		hidden_mask = torch.tensor(scores_dict['hidden_scores'] > threshold).float()
 
 		attn_occ, mlp_occ, intermed_occ, hidden_occ = attn_mask.mean(), mlp_mask.mean(), intermed_mask.mean(), hidden_mask.mean()
 
@@ -279,7 +291,7 @@ class My_Trainer(Trainer):
 				this_occ_dict = self.reset_base_zs(module_perfs)
 				assert all([occ <= prev_occ_dict[k] for k, occ in this_occ_dict.items()]), 'Occupancy cannot increase over time!'
 				print('\t', ' | '.join(['{}-occupancy : {:.3f}'.format(k, v) for k, v in this_occ_dict.items()]))
-				
+
 				# Get the best mask at the moment
 				cur_best_mask = deepcopy(self.base_zs)
 				for k in self.arch_comp_keys:

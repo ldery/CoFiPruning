@@ -35,16 +35,16 @@ def load_model_with_zs(model_path, model_class, zs=None):
 	prune_model_with_z(zs, model)
 	print(f"Model Size after pruning: {calculate_parameters(model)}")
 
-# 	import pdb
-	with torch.no_grad():
-		for k, v in model.named_parameters():
-			if 'LayerNorm' in k:
-# 				print(k, v.shape, v.mean().item(), v.std().item())
-				v.fill_(1.0)
-				if 'bias' in k:
-					v.zero_()
-# 				print('after', v.mean().item(), v.std().item())
-# 	pdb.set_trace()
+# # 	import pdb
+# 	with torch.no_grad():
+# 		for k, v in model.named_parameters():
+# 			if 'LayerNorm' in k:
+# # 				print(k, v.shape, v.mean().item(), v.std().item())
+# 				v.fill_(1.0)
+# 				if 'bias' in k:
+# 					v.zero_()
+# # 				print('after', v.mean().item(), v.std().item())
+# # 	pdb.set_trace()
 	return model
 
 def load_model(model_path, model_class, zs=None):

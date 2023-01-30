@@ -47,7 +47,7 @@ learning_rate=$3
 distillation_path=${5}
 scheduler_type=none
 output_dir=$pretrained_pruned_model/FT-lr${learning_rate}
-epochs=120
+epochs=60
 batch_size=64
 warmupsteps=100
 
@@ -55,6 +55,8 @@ warmupsteps=100
 mkdir -p $output_dir
 pruning_type=None
 
+# 	   --do_distill \
+# 	   --distillation_path $distillation_path \
 
 python3 $code_dir/run_glue_prune.py \
 	   --output_dir ${output_dir} \
@@ -76,7 +78,5 @@ python3 $code_dir/run_glue_prune.py \
 	   --eval_steps ${eval_steps} \
 	   --evaluation_strategy steps \
 	   --distill_ce_loss_alpha 1.0 \
-# 	   --do_distill \
-# 	   --distillation_path $distillation_path \
 	   --seed ${seed} 2>&1 | tee $output_dir/all_log.txt
 
