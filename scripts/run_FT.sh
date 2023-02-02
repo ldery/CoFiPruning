@@ -47,7 +47,7 @@ learning_rate=$3
 distillation_path=${5}
 scheduler_type=none
 output_dir=$pretrained_pruned_model/FT-lr${learning_rate}
-epochs=30
+epochs=60
 batch_size=64
 warmupsteps=100
 

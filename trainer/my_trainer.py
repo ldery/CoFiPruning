@@ -166,6 +166,7 @@ class My_Trainer(Trainer):
 		inputs = self._prepare_inputs(inputs)
 		out_dict = self.model(**inputs)
 		if return_dict:
+			out_dict['labels'] = inputs.get("labels")
 			return out_dict
 		return out_dict['pooler_output'], inputs.get("labels")
 
@@ -282,36 +283,47 @@ class My_Trainer(Trainer):
 
 		layer_and_upwards_params = get_at_and_above_params(self.model, this_layer)
 		print('Performing distillation on layers including and above : ', this_layer)
+
 		for step_ in range(distill_steps):
-			# Get a batch of training data
+# 			Get a batch of training data
 			tr_inputs = self.get_next_batch(is_train=True)
 
-			# Need to reduce the size of this batch
+# 			Need to reduce the size of this batch
 			for k, v in tr_inputs.items():
 				tr_inputs[k] = v[:64] # This seems like a reasonable batch size
 
 			# Pass through the teacher model
 			with torch.no_grad():
 				teacher_outputs = self.teacher_model(**self._prepare_inputs(tr_inputs))
+				this_inputs = self.get_next_batch(is_train=True)
+				tr_outputs = self.run_through_model(self.base_zs, this_inputs)
+
 			student_outputs = self.run_through_model(self.base_zs, tr_inputs, return_dict=True)
+			test_outs = student_outputs['pooler_output'], student_outputs["labels"]
+			head_loss = self.linear_fit_and_evaluate(tr_outputs, test_outs, return_loss=True)
 
 			# calculate the losses
 			layer_loss, n_units = 0.0, 1.0
-			layer_loss += mse_loss(student_outputs['pooler_output'], teacher_outputs['pooler_output']) 
-			for ln in range((self.nlayers - 1), this_layer - 1, -1):
-				assert ln >= this_layer, 'We have an invalid layer for the distill loss'
-				if self.base_zs['mlp_z'][ln]:
-					n_units += 1
-					# + 1 to discount the embedding layer inputs
-					layer_loss += mse_loss(student_outputs['hidden_states'][ln + 1], teacher_outputs['hidden_states'][ln + 1])  
-				if self.base_zs['head_z'][ln].sum():
-					n_units += 1
-					layer_loss += mse_loss(student_outputs['attentions'][ln], teacher_outputs['attentions'][ln])
-			layer_loss = layer_loss / n_units
+# 			layer_loss += mse_loss(student_outputs['pooler_output'], teacher_outputs['pooler_output']) 
+# 			for ln in range((self.nlayers - 1), this_layer - 1, -1):
+# 				assert ln >= this_layer, 'We have an invalid layer for the distill loss'
+# 				if self.base_zs['mlp_z'][ln]:
+# 					n_units += 1
+# 					# + 1 to discount the embedding layer inputs
+# 					layer_loss += mse_loss(student_outputs['hidden_states'][ln + 1], teacher_outputs['hidden_states'][ln + 1])  
+# 				if self.base_zs['head_z'][ln].sum():
+# 					n_units += 1
+# 					layer_loss += mse_loss(student_outputs['attentions'][ln], teacher_outputs['attentions'][ln])
+# 			layer_loss = layer_loss / n_units
+
 
 			# TODO [add the loss for the metric we are maximizing]
-# 			print(step_, layer_loss.item())
-			grads = torch.autograd.grad(layer_loss, layer_and_upwards_params, allow_unused=True)
+# 			print(step_, layer_loss.item(), head_loss.item())
+			print(step_, head_loss.item())
+
+
+			final_loss = head_loss #layer_loss + head_loss
+			grads = torch.autograd.grad(final_loss, layer_and_upwards_params, allow_unused=True)
 			with torch.no_grad():
 				for p, g in zip(layer_and_upwards_params, grads):
 					if g is not None:
@@ -332,26 +344,23 @@ class My_Trainer(Trainer):
 		if not_random_:
 			initial_occupancy = calculate_parameters(self.model)
 			target_sparsity = 0.8 # TODO [ldery] -- modify this to be a HP
-			quantile_threshold = 1.0
+			quantile_threshold = 0.1
 			best_perf, total_time = -1, 0.0
 			round_, max_rounds = 0, 11 # TODO [ldery] -- modify this to be a HP
 			while round_ < max_rounds:
 				start_time = time.time()
 				print('Starting round : ', round_)
 				broke = False
-				quantile_threshold /= 2.0
 				for layer_id in list(range((self.nlayers - 1), -1, -1)):
 					print('Working on layer : ', layer_id)
 					self.prep_base_zs_layer(layer_id)
 
 					best_perf, best_random_mask, module_perfs = self.construct_module_scores(n_total_masks, layer_id)
-					print('Best Perf : ', best_perf)
 					this_occ_dict = self.reset_base_zs(module_perfs, [layer_id], quantile_threshold)
-					# TODO [ldery] -- do we want to think about some sort of distillation at this point ??
+					print('\t', ' | '.join(['{}-occupancy : {:.3f}'.format(k, v) for k, v in this_occ_dict.items()]))
+
 					self.distill_prev_layers(layer_id)
 
-	# 				assert all([occ <= prev_occ_dict[k] for k, occ in this_occ_dict.items()]), 'Occupancy cannot increase over time!'
-					print('\t', ' | '.join(['{}-occupancy : {:.3f}'.format(k, v) for k, v in this_occ_dict.items()]))
 					if round_ == 0:
 						# Do a sanity check
 						self.check_zs(layer_id)
@@ -410,7 +419,7 @@ class My_Trainer(Trainer):
 		return np.array(torch.cat([on_scores, off_scores], axis=-1))
 
 
-	def linear_fit_and_evaluate(self, train_, test_):
+	def linear_fit_and_evaluate(self, train_, test_, return_loss=False):
 		xs, ys = train_
 		test_x, test_y = test_
 
@@ -425,19 +434,27 @@ class My_Trainer(Trainer):
 		optim = Adam(linear_model.parameters(), lr=2e-2) # TODO [ldery] -- modify this to be a HP
 		max_eval_acc = -1.0
 		num_iters = 20 # TODO[ldery] - ablate the number of steps
+		if return_loss:
+			loss_ = None
 		for j_ in range(num_iters): 
 			optim.zero_grad()
 			logits_ = linear_model(xs).view(-1, self.num_labels)
 			loss_ = CrossEntropyLoss()(logits_, ys.view(-1))
 			loss_.backward()
 			optim.step()
-			if (j_ % 5 == 0) or (j_ == (num_iters - 1)):
-				# Now do an eval step
-				linear_model.eval()
-				predictions = linear_model(test_x).argmax(axis=-1)
-				eval_accuracy = (predictions.eq(test_y) * 1.0).mean().item()
-				max_eval_acc = max(max_eval_acc, eval_accuracy)
-				linear_model.train()
+			if not return_loss:
+				if (j_ % 5 == 0) or (j_ == (num_iters - 1)):
+					# Now do an eval step
+					linear_model.eval()
+					predictions = linear_model(test_x).argmax(axis=-1)
+					eval_accuracy = (predictions.eq(test_y) * 1.0).mean().item()
+					max_eval_acc = max(max_eval_acc, eval_accuracy)
+					linear_model.train()
+		if return_loss:
+			loss = nn.CrossEntropyLoss()
+			predictions = linear_model(test_x)
+			return loss(predictions, test_y)
+
 # 			print(j_, loss_.item(), eval_accuracy, max_eval_acc)
 # 		print(max_eval_acc)
 # 		print('---'*30)
