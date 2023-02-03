@@ -19,7 +19,7 @@ task_name=$1
 data_dir=$proj_dir/data/glue_data/${task_name}
 
 # pretrain model
-model_name_or_path=bert-base-uncased
+model_name_or_path=${11}
 
 # logging & saving
 logging_steps=100
