@@ -28,7 +28,6 @@ save_steps=0
 
 # train parameters
 max_seq_length=128
-batch_size=32 
 learning_rate=2e-5
 reg_learning_rate=0.01
 epochs=20 
@@ -50,7 +49,10 @@ distill_layer_loss_alpha=$7
 distill_ce_loss_alpha=$8
 distill_temp=2
 # 2: fix hidden layers, 3: min distance matching without restriction, 4: min distance matching with restriction
-layer_distill_version=${9} 
+layer_distill_version=${9}
+fitness_str=${11}
+batch_size=${12}
+
 
 scheduler_type=linear
 
@@ -107,6 +109,7 @@ python3 $code_dir/my_run_glue_prune.py \
      --target_sparsity $target_sparsity \
      --freeze_embeddings \
      --do_distill \
+     --fitness_strategy $fitness_str \
      --distillation_path $distillation_path \
      --distill_ce_loss_alpha $distill_ce_loss_alpha \
      --distill_loss_alpha $distill_layer_loss_alpha \

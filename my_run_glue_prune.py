@@ -371,7 +371,6 @@ def main():
 
 	# Need to do the fancy pertubative stuff here
 	training_args.per_device_eval_batch_size = 1024 # TODO [ldery] - hardcoded - need to fix
-	training_args.per_device_train_batch_size = 256 #training_args.per_device_eval_batch_size
 	trainer = My_Trainer(
 		model=model,
 		args=training_args,
@@ -386,6 +385,7 @@ def main():
 	)
 
 	if training_args.do_train:
+		print('Saving model details')
 		trainer.train()
 		trainer.save_model()
 		tokenizer.save_pretrained(training_args.output_dir)
