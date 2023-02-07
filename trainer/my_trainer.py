@@ -133,8 +133,6 @@ class My_Trainer(Trainer):
 		self.val_batcher = iter(self.get_eval_dataloader())
 		self.fitness_strategy = self.additional_args.fitness_strategy
 		self.masks_per_round = self.additional_args.masks_per_round
-		# TODO [ldery] -- make use of this variable
-		# additional_args.do_global_thresholding
 
 	def gen_random_mask(self):
 		mask = {}
@@ -197,7 +195,38 @@ class My_Trainer(Trainer):
 		else: 
 			raise ValueError('Incorrect fitness strategy specified : ', fitness_strategy)
 
-	def reset_base_zs(self, module_perfs):
+	def normalize_scores(self, scores, type_=None):
+		mean_, std_ = np.nanmean(scores), np.nanstd(scores)
+		normalized_scores = (scores - mean_) / (std_ + 1e-8) # epsilon
+		normalized_scores = np.nanmean(normalized_scores, axis=0)
+		if type_ in ['head_z', 'intermediate_z']:
+			normalized_scores = normalized_scores[:, :, 0] - normalized_scores[:, :, 1]
+		else:
+			normalized_scores = normalized_scores[:, 0] - normalized_scores[:, 1]
+		return normalized_scores
+
+	def reset_base_zs_local(self, module_perfs):
+		occupancies = {}
+		for k in self.arch_comp_keys:
+			scores = np.array(module_perfs[k])
+			scores[scores < 0] = np.NaN
+			normalized_scores = self.normalize_scores(scores, type_=k)
+
+			aggregate = (normalized_scores[self.base_zs[k].squeeze() > 0]).flatten()
+			threshold = np.quantile(aggregate, self.additional_args.quantile_cutoff)
+			mask = torch.tensor(normalized_scores > threshold).float() 
+
+			if k == 'head_z':
+				mask = mask.unsqueeze(1).unsqueeze(-1).unsqueeze(-1)
+			elif k == 'intermediate_z':
+				mask = mask.unsqueeze(1).unsqueeze(1)
+
+			self.base_zs[k] *= mask
+			occupancies[k] = (self.base_zs[k] * 2.0).mean().item() # Because we have 0.5 as the bernoulli probability
+
+		return occupancies
+
+	def reset_base_zs_global(self, module_perfs):
 		scores_dict = {}
 		aggregate = []
 
@@ -241,7 +270,12 @@ class My_Trainer(Trainer):
 			print('Resetting Initial Based Mask')
 			scores_dict = pkl.load(open(scores_save_path, 'rb'))
 			self.best_random_mask = torch.load(os.path.join(self.args.output_dir, "best_random_mask.pt"))
-			return self.reset_base_zs(scores_dict)
+			self.base_zs = torch.load(os.path.join(self.args.output_dir, "zs.pt"))
+			occupancies = {}
+			for k, v in self.base_zs.items():
+				occupancies[k] = v.mean().item()
+				self.base_zs[k] *= 0.5
+			return occupancies
 		return {k: 1.0 for k in self.arch_comp_keys}
 
 	def construct_module_scores(self, module_perfs=None):
@@ -277,7 +311,10 @@ class My_Trainer(Trainer):
 				round_ += 1
 				print('Starting Round : ', round_)
 				best_perf, best_random_mask, module_perfs = self.construct_module_scores(module_perfs=module_perfs)
-				this_occ_dict = self.reset_base_zs(module_perfs)
+				if self.additional_args.do_local_thresholding:
+					this_occ_dict = self.reset_base_zs_local(module_perfs)
+				else:
+					this_occ_dict = self.reset_base_zs_global(module_perfs)
 
 				print('\t', ' | '.join(['{}-occupancy : {:.3f}'.format(k, v) for k, v in this_occ_dict.items()]))
 				assert all([occ <= prev_occ_dict[k] for k, occ in this_occ_dict.items()]), 'Occupancy should not increase over time!'

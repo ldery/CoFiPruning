@@ -45,20 +45,45 @@ ex_name=${task_name}_${ex_name_suffix}
 pretrained_pruned_model=${4}
 learning_rate=$3
 distillation_path=${5}
+reset_ln=${6}
 scheduler_type=none
-output_dir=$pretrained_pruned_model/FT-lr${learning_rate}
-epochs=60
+epochs=40
 batch_size=64
 warmupsteps=100
 
-
-mkdir -p $output_dir
 pruning_type=None
 
-# 	   --do_distill \
-# 	   --distillation_path $distillation_path \
 
-python3 $code_dir/run_glue_prune.py \
+if [[ $reset_ln == True ]]; then
+  echo 'Inside Resetting LN'
+  output_dir=$pretrained_pruned_model/LNReset_FT-lr${learning_rate}
+  mkdir -p $output_dir
+  python3 $code_dir/run_glue_prune.py \
+	   --output_dir ${output_dir} \
+	   --logging_steps ${logging_steps} \
+	   --task_name ${task_name} \
+	   --model_name_or_path ${model_name_or_path} \
+	   --ex_name ${ex_name} \
+	   --do_train \
+	   --do_eval \
+	   --reset_LN \
+	   --pretrained_pruned_model ${pretrained_pruned_model} \
+	   --max_seq_length ${max_seq_length} \
+	   --per_device_train_batch_size ${batch_size} \
+	   --per_device_eval_batch_size 32 \
+	   --learning_rate ${learning_rate} \
+	   --num_train_epochs ${epochs} \
+	   --overwrite_output_dir \
+	   --save_steps ${save_steps} \
+	   --eval_steps ${eval_steps} \
+	   --evaluation_strategy steps \
+	   --distill_ce_loss_alpha 1.0 \
+	   --seed ${seed} 2>&1 | tee $output_dir/all_log.txt
+else
+  echo 'Inside No resetting of LN'
+  output_dir=$pretrained_pruned_model/FT-lr${learning_rate}
+  mkdir -p $output_dir
+  python3 $code_dir/run_glue_prune.py \
 	   --output_dir ${output_dir} \
 	   --logging_steps ${logging_steps} \
 	   --task_name ${task_name} \
@@ -73,10 +98,11 @@ python3 $code_dir/run_glue_prune.py \
 	   --learning_rate ${learning_rate} \
 	   --num_train_epochs ${epochs} \
 	   --overwrite_output_dir \
-	   --warmup_steps ${warmupsteps} \
 	   --save_steps ${save_steps} \
 	   --eval_steps ${eval_steps} \
 	   --evaluation_strategy steps \
 	   --distill_ce_loss_alpha 1.0 \
 	   --seed ${seed} 2>&1 | tee $output_dir/all_log.txt
+fi
 
+# 	   --warmup_steps ${warmupsteps} \

@@ -34,18 +34,20 @@ class AdditionalArguments():
 
 	droprate_init: float = field(default=0.5, metadata={"help": "Init parameter for loga"})
 	quantile_cutoff: float = field(default=0.1, metadata={"help": "Quantile cuttoff for our method"})
-	masks_per_round: int = field(default=50, metadata={"help": "Number of masks to use per-round"})
+	masks_per_round: int = field(default=500, metadata={"help": "Number of masks to use per-round"})
 	max_prune_rounds: int = field(default=20, metadata={"help": "Max Number of pruning rounds to perform"})
 	temperature: float = field(default=2./3., metadata={"help": "Temperature controlling hard concrete distribution"})
 	prepruning_finetune_epochs: int = field(default=1, metadata={"help": "Finetuning epochs before pruning"})
 	lagrangian_warmup_epochs: int = field(default=2, metadata={"help": "Number of epochs for lagrangian warmup"})
 	target_sparsity: float = field(default=0, metadata={"help": "Target sparsity (pruned percentage)"})
-	sparsity_epsilon: float = field(default=0, metadata={"help": "Epsilon for sparsity"})
+	sparsity_epsilon: float = field(default=0.004, metadata={"help": "Epsilon for sparsity"})
 
 	# distillation setup
 	distillation_path: str = field(default=None, metadata={"help": "Path of the teacher model for distillation."})
 	do_distill: bool = field(default=False, metadata={"help": "Whether to do distillation or not, prediction layer."})
-	do_global_thresholding: bool = field(default=True, metadata={"help": "Whether to do Global or Local thresholding"})
+	do_local_thresholding: bool = field(default=False, metadata={"help": "Whether to do Global or Local thresholding"})
+	reset_LN: bool = field(default=False, metadata={"help": "Whether to reset the layer norm parameters during finetuning"})
+
 
 	do_layer_distill: bool = field(default=False, metadata={"help": "Align layer output through distillation"})
 	layer_distill_version: int = field(default=1, metadata={"help": "1: add loss to each layer, 2: add loss to existing layers only"})

@@ -4,6 +4,8 @@ from transformers.modeling_utils import prune_linear_layer
 from transformers import AutoConfig, BertForSequenceClassification
 from transformers.file_utils import hf_bucket_url, cached_path
 
+import pdb
+from pprint import pprint
 from utils.utils import calculate_parameters
 
 def edit_config(config, additional_args):
@@ -16,15 +18,23 @@ def initialize_layer_transformation(model):
 		torch.eye(len(model.layer_transformation.weight)))
 	model.layer_transformation.bias.data.fill_(0)
 
-def load_model_with_zs(model_path, model_class, zs=None):
+def load_model_with_zs(model_path, model_class, zs=None, reset_LN=False):
 	config_path = os.path.join(model_path, "config.json")
 	if os.path.exists(config_path):
 		config = AutoConfig.from_pretrained(model_path)
 	
 	model = model_class(config)
 
-# 	model = model_class.from_pretrained(model_path, config=config)
-# 	p = os.path.join(model_path, "pytorch_model.bin")
+# 	print('This is before we load')
+# 	pprint({k: v.mean().item() for k, v in model.named_parameters() if 'bias' not in k})
+	model = model_class.from_pretrained(model_path, config=config)
+	
+	print('Lucio : -- make sure that if we have implemented backward pass version we need to load the updated weights')
+# 	pdb.set_trace()
+# 	print('This is After we load')
+# 	pprint({k: v.mean().item() for k, v in model.named_parameters() if 'bias' not in k})
+# 	exit()
+# 	p = os.path.join(model_path, "pytorch_model.bin")s
 # 	loaded_weights = torch.load(p, map_location="cpu")
 
 # 	model.load_state_dict(loaded_weights)
@@ -35,21 +45,22 @@ def load_model_with_zs(model_path, model_class, zs=None):
 	prune_model_with_z(zs, model)
 	print(f"Model Size after pruning: {calculate_parameters(model)}")
 
-# # 	import pdb
-# 	with torch.no_grad():
-# 		for k, v in model.named_parameters():
-# 			if 'LayerNorm' in k:
-# # 				print(k, v.shape, v.mean().item(), v.std().item())
-# 				v.fill_(1.0)
-# 				if 'bias' in k:
-# 					v.zero_()
-# # 				print('after', v.mean().item(), v.std().item())
-# # 	pdb.set_trace()
+	if reset_LN:
+		print('We are resetting the layer-norm parameters')
+		with torch.no_grad():
+			for k, v in model.named_parameters():
+				if 'LayerNorm' in k:
+					v.fill_(1.0)
+					if 'bias' in k:
+						v.zero_()
+	else:
+		print('We did not reset the layer-norm parameters')
+
 	return model
 
-def load_model(model_path, model_class, zs=None):
+def load_model(model_path, model_class, zs=None, reset_LN=False):
 	assert zs is not None
-	model = load_model_with_zs(model_path, model_class, zs)
+	model = load_model_with_zs(model_path, model_class, zs, reset_LN)
 	print(f"Model Size: {calculate_parameters(model)}")
 	return model
 

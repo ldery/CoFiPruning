@@ -19,7 +19,6 @@ task_name=$1
 data_dir=$proj_dir/data/glue_data/${task_name}
 
 # pretrain model
-model_name_or_path=bert-base-uncased
 
 # logging & saving
 logging_steps=100
@@ -52,7 +51,10 @@ distill_temp=2
 layer_distill_version=${9}
 fitness_str=${11}
 batch_size=${12}
-
+do_local_thresholding=${13}
+masks_per_round=${14}
+model_name_or_path=${15}
+quantilethreshold=${16}
 
 scheduler_type=linear
 
@@ -85,7 +87,11 @@ fi
 
 mkdir -p $output_dir
 
-python3 $code_dir/my_run_glue_prune.py \
+echo $do_local_thresholding
+
+if [[ $do_local_thresholding == True ]]; then
+  echo 'Inside the True (local) loop'
+  python3 $code_dir/my_run_glue_prune.py \
 	   --output_dir ${output_dir} \
 	   --logging_steps ${logging_steps} \
 	   --task_name ${task_name} \
@@ -109,6 +115,9 @@ python3 $code_dir/my_run_glue_prune.py \
      --target_sparsity $target_sparsity \
      --freeze_embeddings \
      --do_distill \
+     --do_local_thresholding \
+     --masks_per_round $masks_per_round \
+     --quantile_cutoff $quantilethreshold \
      --fitness_strategy $fitness_str \
      --distillation_path $distillation_path \
      --distill_ce_loss_alpha $distill_ce_loss_alpha \
@@ -118,6 +127,45 @@ python3 $code_dir/my_run_glue_prune.py \
      --layer_distill_version $layer_distill_version \
      --prepruning_finetune_epochs $prepruning_finetune_epochs \
      --lagrangian_warmup_epochs $lagrangian_warmup_epochs 2>&1 | tee ${output_dir}/log.txt
+else
+  echo 'Inside the False (global) loop'
+  python3 $code_dir/my_run_glue_prune.py \
+	   --output_dir ${output_dir} \
+	   --logging_steps ${logging_steps} \
+	   --task_name ${task_name} \
+	   --model_name_or_path ${model_name_or_path} \
+	   --ex_name ${ex_name} \
+	   --do_train \
+	   --do_eval \
+	   --max_seq_length ${max_seq_length} \
+	   --per_device_train_batch_size ${batch_size} \
+	   --per_device_eval_batch_size 32 \
+	   --learning_rate ${learning_rate} \
+	   --reg_learning_rate ${reg_learning_rate} \
+	   --num_train_epochs ${epochs} \
+	   --overwrite_output_dir \
+	   --save_steps ${save_steps} \
+	   --eval_steps ${eval_steps} \
+	   --evaluation_strategy steps \
+	   --seed ${seed} \
+	   --pruning_type ${pruning_type} \
+     --pretrained_pruned_model ${pretrained_pruned_model} \
+     --target_sparsity $target_sparsity \
+     --freeze_embeddings \
+     --do_distill \
+     --masks_per_round $masks_per_round \
+     --quantile_cutoff $quantilethreshold \
+     --fitness_strategy $fitness_str \
+     --distillation_path $distillation_path \
+     --distill_ce_loss_alpha $distill_ce_loss_alpha \
+     --distill_loss_alpha $distill_layer_loss_alpha \
+     --distill_temp $distill_temp \
+     --scheduler_type $scheduler_type \
+     --layer_distill_version $layer_distill_version \
+     --prepruning_finetune_epochs $prepruning_finetune_epochs \
+     --lagrangian_warmup_epochs $lagrangian_warmup_epochs 2>&1 | tee ${output_dir}/log.txt 
+fi
+
 
 #      --do_layer_distill \ # [todo - ldery - undo this]
 
