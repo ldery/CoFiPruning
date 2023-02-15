@@ -15,7 +15,7 @@ PERROUND=$6
 BERTTYPE=bert-$7-uncased
 QUANTTHRESH=$8
 SUFFIX=${SUFFIX}_${DISTILLATION_PATH}_${FITNESS_STR}_LOCALTHESH_${LOCAL_THRESHOLDING}_perrounds_${PERROUND}_BERT_$7_QUANTHRESH_$8_BSZ_$BSZ
-
+DISTILLATION_PATH=JeremiahZ/bert-base-uncased-rte
 # /mnt/lustre/sjtu/home/xc915/superb/CoFiPruning/teacher-model
 
 echo $SUFFIX

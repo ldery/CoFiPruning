@@ -35,6 +35,7 @@ from args import AdditionalArguments
 from utils.cofi_utils import *
 from utils.utils import *
 from torch.nn import CrossEntropyLoss
+import random
 
 import wandb
 import pdb
@@ -127,7 +128,7 @@ class My_Trainer(Trainer):
 			v_.zero_().fill_(fill_val)
 			v_.requires_grad = False
 			self.base_zs[k] = v_
-		
+
 		self.acceptable_sparsity_delta = self.additional_args.sparsity_epsilon
 		self.train_batcher = iter(self.get_train_dataloader())
 		self.val_batcher = iter(self.get_eval_dataloader())
@@ -281,9 +282,14 @@ class My_Trainer(Trainer):
 	def construct_module_scores(self, module_perfs=None):
 		module_perfs = defaultdict(list) if module_perfs is None else module_perfs
 		best_perf_so_far, best_random_mask = -1.0, None
+
 		for mask_ in tqdm(range(self.masks_per_round)):
 			cur_mask = self.gen_random_mask()
-			this_perf = self.get_mask_perf(cur_mask)
+			
+			if self.additional_args.get_random_architecture:
+				this_perf = random.uniform(0, 1)
+			else:
+				this_perf = self.get_mask_perf(cur_mask)
 
 			for key in self.arch_comp_keys:
 				scores = self.set_scores(cur_mask[key].squeeze().unsqueeze(-1), this_perf)
@@ -299,52 +305,51 @@ class My_Trainer(Trainer):
 		# TODO[ldery] - go from hard-coded value
 		mask_embeddings_map = []
 		self.model.eval()
-		not_random_ = True
 		prev_occ_dict = self.check_and_retrieve_past_runs()
 		print('We achieved the following loaded occupancies')
 		print(' | '.join(['{}-occupancy : {:.3f}'.format(k, v) for k, v in prev_occ_dict.items()]))
-		if not_random_:
-			initial_occupancy = calculate_parameters(self.model)
-			best_perf, module_perfs = -1, None
-			round_ = 0
-			while round_ < self.additional_args.max_prune_rounds:
-				round_ += 1
-				print('Starting Round : ', round_)
-				best_perf, best_random_mask, module_perfs = self.construct_module_scores(module_perfs=module_perfs)
-				if self.additional_args.do_local_thresholding:
-					this_occ_dict = self.reset_base_zs_local(module_perfs)
-				else:
-					this_occ_dict = self.reset_base_zs_global(module_perfs)
 
-				print('\t', ' | '.join(['{}-occupancy : {:.3f}'.format(k, v) for k, v in this_occ_dict.items()]))
-				assert all([occ <= prev_occ_dict[k] for k, occ in this_occ_dict.items()]), 'Occupancy should not increase over time!'
+		initial_occupancy = calculate_parameters(self.model)
+		round_ = 0
+		best_perf, module_perfs = -1, None
+		while round_ < self.additional_args.max_prune_rounds:
+			round_ += 1
+			print('Starting Round : ', round_)
+			best_perf, best_random_mask, module_perfs = self.construct_module_scores(module_perfs=module_perfs)
+			if self.additional_args.do_local_thresholding:
+				this_occ_dict = self.reset_base_zs_local(module_perfs)
+			else:
+				this_occ_dict = self.reset_base_zs_global(module_perfs)
 
-				# Get the best mask at the moment
-				cur_best_mask = deepcopy(self.base_zs)
-				for k in self.arch_comp_keys:
-					cur_best_mask[k] *= 2.0
+			print('\t', ' | '.join(['{}-occupancy : {:.3f}'.format(k, v) for k, v in this_occ_dict.items()]))
+			assert all([occ <= prev_occ_dict[k] for k, occ in this_occ_dict.items()]), 'Occupancy should not increase over time!'
 
-				our_perf = self.get_mask_perf(cur_best_mask)
-				print('\t', '[{}] Best Random Perf : {:.3f}. Our Perf : {:.3f}'.format(self.fitness_strategy, best_perf, our_perf))
-				if self.additional_args.fitness_strategy != 'linear_fit':
-					random_perf = self.get_mask_perf(best_random_mask, fitness_strategy='linear_fit')
-					our_perf = self.get_mask_perf(cur_best_mask, fitness_strategy='linear_fit')
-					print('\t', '[Linear Fit]| Best Random Perf : {:.3f}. Our Perf : {:.3f}'.format(random_perf, our_perf))
+			# Get the best mask at the moment
+			cur_best_mask = deepcopy(self.base_zs)
+			for k in self.arch_comp_keys:
+				cur_best_mask[k] *= 2.0
 
-				# Caching for saving in case this is the last round
-				self.best_random_mask = best_random_mask
-				self.module_perfs = module_perfs
-				self.best_zs = cur_best_mask
+			our_perf = self.get_mask_perf(cur_best_mask)
+			print('\t', '[{}] Best Random Perf : {:.3f}. Our Perf : {:.3f}'.format(self.fitness_strategy, best_perf, our_perf))
+			if self.additional_args.fitness_strategy != 'linear_fit':
+				random_perf = self.get_mask_perf(best_random_mask, fitness_strategy='linear_fit') if best_random_mask else None
+				our_perf = self.get_mask_perf(cur_best_mask, fitness_strategy='linear_fit')
+				print('\t', '[Linear Fit]| Best Random Perf : {:.3f}. Our Perf : {:.3f}'.format(random_perf, our_perf))
 
-				cur_sparsity = self.calculate_model_sparsity(cur_best_mask, initial_occupancy)
-				print('\t', 'Current Sparsity Level : {:.3f}'.format(cur_sparsity))
-				if abs(cur_sparsity - self.additional_args.target_sparsity) < self.acceptable_sparsity_delta:
-					break
+			# Caching for saving in case this is the last round
+			self.best_random_mask = best_random_mask
+			self.module_perfs = module_perfs
+			self.best_zs = cur_best_mask
 
-				if cur_sparsity > self.additional_args.target_sparsity:
-					print('\t', 'We overshot. Post Hoc Fix with Module Perfs Recommended')
-					break
-				prev_occ_dict = this_occ_dict
+			cur_sparsity = self.calculate_model_sparsity(cur_best_mask, initial_occupancy)
+			print('\t', 'Current Sparsity Level : {:.3f}'.format(cur_sparsity))
+			if abs(cur_sparsity - self.additional_args.target_sparsity) < self.acceptable_sparsity_delta:
+				break
+
+			if cur_sparsity > self.additional_args.target_sparsity:
+				print('\t', 'We overshot. Post Hoc Fix with Module Perfs Recommended')
+				break
+			prev_occ_dict = this_occ_dict
 
 
 	def calculate_model_sparsity(self, mask, initial_occupancy):
