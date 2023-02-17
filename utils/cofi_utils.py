@@ -23,14 +23,9 @@ def load_model_with_zs(model_path, model_class, zs=None, reset_LN=False):
 	if os.path.exists(config_path):
 		config = AutoConfig.from_pretrained(model_path)
 	
-	model = model_class(config)
-
-# 	print('This is before we load')
-# 	pprint({k: v.mean().item() for k, v in model.named_parameters() if 'bias' not in k})
 	model = model_class.from_pretrained(model_path, config=config)
 	
 	print('Lucio : -- make sure that if we have implemented backward pass version we need to load the updated weights')
-# 	pdb.set_trace()
 # 	print('This is After we load')
 # 	pprint({k: v.mean().item() for k, v in model.named_parameters() if 'bias' not in k})
 # 	exit()
@@ -131,13 +126,14 @@ def prune_model_with_z(zs, model, verbose=False):
 	if zs is None:
 		return None, None
 	bert = model.bert if hasattr(model, "bert") else model.roberta
-
+	num_layers = None
 	if "head_z" in zs:
 		head_z = zs.get("head_z", None)
 		head_layer_z = zs.get("head_layer_z", None)
 
 		prune_heads = {}
-		for layer in range(len(head_z)):
+		num_layers = len(head_z)
+		for layer in range(num_layers):
 			head_z_layer = head_z[layer].cpu().squeeze().clone()
 			if head_layer_z is not None:
 				head_z_layer *= head_layer_z[layer]
@@ -152,7 +148,8 @@ def prune_model_with_z(zs, model, verbose=False):
 		kept_intermediate_dims = {}
 		intermediate_zs = zs["intermediate_z"]
 		mlp_z = zs.get("mlp_z", None)
-		for layer in range(len(intermediate_zs)):
+		num_layers = num_layers if num_layers else len(intermediate_zs) 
+		for layer in range(num_layers):
 			intermediate_z_layer = intermediate_zs[layer].squeeze()
 			intermediate_z_layer = intermediate_z_layer.cpu().clone()
 			if mlp_z is not None:
@@ -186,7 +183,8 @@ def prune_model_with_z(zs, model, verbose=False):
 		bert.embeddings.token_type_embeddings.embedding_dim = index.shape[0]
 		prune_layer_norm(bert.embeddings.LayerNorm, index)
 
-		for layer in range(0, 12):
+		assert num_layers is not None, 'The number of layers should have been set by now'
+		for layer in range(0, num_layers):
 			if bert.encoder.layer[layer].attention.self.query is not None:
 				bert.encoder.layer[layer].attention.self.query = \
 					prune_layer(bert.encoder.layer[layer].attention.self.query , index, dim=1)
@@ -227,7 +225,7 @@ def prune_model_with_z(zs, model, verbose=False):
 		prune_intermediate_layers(model, kept_intermediate_dims)
 	
 	if verbose:
-		for layer in range(0, 12):
+		for layer in range(0, num_layers):
 			print("Layer:", layer)
 			if bert.encoder.layer[layer].attention.self.query is not None:
 				print("query:", bert.encoder.layer[layer].attention.self.query.weight.shape)

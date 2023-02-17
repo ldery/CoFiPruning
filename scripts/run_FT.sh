@@ -15,7 +15,6 @@ task_name=$1
 data_dir=$proj_dir/data/glue_data/${task_name}
 
 # pretrain model
-model_name_or_path=bert-base-uncased
 
 # logging & saving
 logging_steps=100
@@ -45,6 +44,8 @@ ex_name=${task_name}_${ex_name_suffix}
 pretrained_pruned_model=${4}
 learning_rate=$3
 distillation_path=${5}
+model_name_or_path=$distillation_path # This is assuming that the distillation path is the same as the model path
+
 reset_ln=${6}
 scheduler_type=none
 epochs=40
