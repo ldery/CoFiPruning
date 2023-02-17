@@ -48,6 +48,7 @@ class AdditionalArguments():
 	do_local_thresholding: bool = field(default=False, metadata={"help": "Whether to do Global or Local thresholding"})
 	reset_LN: bool = field(default=False, metadata={"help": "Whether to reset the layer norm parameters during finetuning"})
 	get_random_architecture: bool = field(default=False, metadata={"help": "Whether we want to get a random architecture"})
+	do_greedy_baseline: bool = field(default=True, metadata={"help": "Whether to use the greedy baseline of turning on / off a single structured module."})
 
 	do_layer_distill: bool = field(default=False, metadata={"help": "Align layer output through distillation"})
 	layer_distill_version: int = field(default=1, metadata={"help": "1: add loss to each layer, 2: add loss to existing layers only"})

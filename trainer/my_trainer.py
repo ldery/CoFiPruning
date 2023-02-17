@@ -134,10 +134,12 @@ class My_Trainer(Trainer):
 		self.val_batcher = iter(self.get_eval_dataloader())
 		self.fitness_strategy = self.additional_args.fitness_strategy
 		self.masks_per_round = self.additional_args.masks_per_round
+		self.do_greedy_baseline = self.additional_args.do_greedy_baseline
 
-	def gen_random_mask(self):
+	def gen_random_mask(self, base_zs=None):
+		base_zs = base_zs if base_zs else self.base_zs
 		mask = {}
-		for k, v in self.base_zs.items():
+		for k, v in base_zs.items():
 			if k in self.arch_comp_keys:
 				mask[k] = torch.bernoulli(v)
 			else:
@@ -231,6 +233,7 @@ class My_Trainer(Trainer):
 		scores_dict = {}
 		aggregate = []
 
+		
 		for k, scores in module_perfs.items():
 			scores = np.array(scores)
 			scores[scores < 0] = np.NaN
@@ -301,6 +304,46 @@ class My_Trainer(Trainer):
 
 		return best_perf_so_far, best_random_mask, module_perfs
 
+	def greedy_construct_module_scores(self, module_perfs=None):
+		module_perfs = defaultdict(list) if module_perfs is None else module_perfs
+		best_perf_so_far = -1.0
+		# Get a clone of the base mask
+		base_zs = deepcopy(self.base_zs)
+		base_zs = {k: (v > 0.0)*1.0 for k, v in base_zs.items()}
+		all_on_perf = self.get_mask_perf(base_zs)
+
+		# Calculate the on perf.
+		for k in self.base_zs.keys():
+			if k not in self.arch_comp_keys:
+				continue
+			# set the all on perf
+			scores = self.set_scores(base_zs[k].squeeze().unsqueeze(-1), all_on_perf)
+			module_perfs[k].append(scores)
+
+			# Go through all on indices.
+			v = base_zs[k]
+			orig_shape = v.shape
+			new_v = v.squeeze().view(-1)
+			for id_ in range(len(new_v)):
+				if new_v[id_] == 0:
+					continue
+				# greedily set this to zero
+				new_v[id_] = 0.0
+				base_zs[k] = new_v.view(orig_shape)
+				this_perf = self.get_mask_perf(base_zs)
+				scores = self.set_scores(base_zs[k].squeeze().unsqueeze(-1), this_perf)
+				module_perfs[k].append(scores)
+				# reset this node
+				new_v[id_] = 1.0
+
+				if this_perf > best_perf_so_far:
+					best_perf_so_far = this_perf
+
+			# reset the base
+			base_zs[k] = v
+
+		return best_perf_so_far, base_zs, module_perfs
+
 	def train(self):
 		# TODO[ldery] - go from hard-coded value
 		mask_embeddings_map = []
@@ -315,7 +358,11 @@ class My_Trainer(Trainer):
 		while round_ < self.additional_args.max_prune_rounds:
 			round_ += 1
 			print('Starting Round : ', round_)
-			best_perf, best_random_mask, module_perfs = self.construct_module_scores(module_perfs=module_perfs)
+			if self.do_greedy_baseline:
+				best_perf, best_random_mask, module_perfs = self.greedy_construct_module_scores(module_perfs=module_perfs)
+			else:
+				best_perf, best_random_mask, module_perfs = self.construct_module_scores(module_perfs=module_perfs)
+
 			if self.additional_args.do_local_thresholding:
 				this_occ_dict = self.reset_base_zs_local(module_perfs)
 			else:
