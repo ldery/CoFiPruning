@@ -336,7 +336,7 @@ class My_Trainer(Trainer):
 				# greedily set this to zero
 				new_v[id_] = 0.0
 				base_zs[k] = new_v.view(orig_shape)
-				this_perf = random.uniform(0, 1) #self.get_mask_perf(base_zs)
+				this_perf = self.get_mask_perf(base_zs) #random.uniform(0, 1) #
 				scores = self.set_scores(base_zs[k].squeeze().unsqueeze(-1), this_perf)
 				module_perfs[k].append(scores)
 				# reset this node
@@ -357,7 +357,6 @@ class My_Trainer(Trainer):
 		prev_occ_dict = self.check_and_retrieve_past_runs()
 		print('We achieved the following loaded occupancies')
 		print(' | '.join(['{}-occupancy : {:.3f}'.format(k, v) for k, v in prev_occ_dict.items()]))
-
 		initial_occupancy = calculate_parameters(self.model)
 		round_ = 0
 		best_perf, module_perfs = -1, None
@@ -370,6 +369,9 @@ class My_Trainer(Trainer):
 			while True:
 				qt = (left_end + right_end)/2
 				base_mask = deepcopy(self.base_zs)
+				for k in self.arch_comp_keys:
+					base_mask[k] *= 2.0 # Need to go from 0.5 to full
+
 				_ = self.reset_base_zs_global(module_perfs, base_mask=base_mask, qt=qt)
 				cur_sparsity = self.calculate_model_sparsity(base_mask, initial_occupancy)
 				print('\t', 'Current Sparsity Level : {:.3f}'.format(cur_sparsity))
@@ -382,7 +384,7 @@ class My_Trainer(Trainer):
 					right_end = qt
 				
 				# check if we cant go any further
-				if abs(right_end - left_end) < 0.05:
+				if abs(right_end - left_end) < 0.01:
 					print('breaking early because there is no more we can do')
 					self.best_zs = base_mask
 					break
