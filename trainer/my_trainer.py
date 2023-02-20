@@ -228,12 +228,12 @@ class My_Trainer(Trainer):
 			occupancies[k] = (self.base_zs[k] * 2.0).mean().item() # Because we have 0.5 as the bernoulli probability
 
 		return occupancies
-
-	def reset_base_zs_global(self, module_perfs):
+	
+	
+	def calculate_threshold(self, module_perfs, base_mask, qt=None):
 		scores_dict = {}
 		aggregate = []
 
-		
 		for k, scores in module_perfs.items():
 			scores = np.array(scores)
 			scores[scores < 0] = np.NaN
@@ -245,14 +245,19 @@ class My_Trainer(Trainer):
 			scores_dict[k] = scores
 
 			# Remove already pruned
-			chosen = scores[self.base_zs[k].squeeze() > 0]
+			chosen = scores[base_mask[k].squeeze() > 0]
 			aggregate.extend(chosen.flatten())
 
 		aggregate = np.array(aggregate)
 		aggregate = aggregate[~np.isnan(aggregate)]
-		threshold = np.quantile(aggregate, self.additional_args.quantile_cutoff)
+		qt = qt if qt else self.additional_args.quantile_cutoff
+		threshold = np.quantile(aggregate, qt)
+		return threshold, scores_dict
 
 
+	def reset_base_zs_global(self, module_perfs, base_mask=None, qt=None):
+		base_mask = base_mask if base_mask else self.base_zs
+		threshold, scores_dict = self.calculate_threshold(module_perfs, base_mask, qt=qt)
 		occupancies = {}
 		for k, scores in scores_dict.items():
 			mask = torch.tensor(scores > threshold).float()
@@ -263,8 +268,8 @@ class My_Trainer(Trainer):
 			elif k == 'intermediate_z':
 				mask = mask.unsqueeze(1).unsqueeze(1)
 
-			self.base_zs[k] *= mask
-			occupancies[k] = (self.base_zs[k] * 2.0).mean().item() # Because we have 0.5 as the bernoulli probability
+			base_mask[k] *= mask
+			occupancies[k] = (base_mask[k] * 2.0).mean().item() # Because we have 0.5 as the bernoulli probability
 
 		return occupancies
 
@@ -316,6 +321,7 @@ class My_Trainer(Trainer):
 		for k in self.base_zs.keys():
 			if k not in self.arch_comp_keys:
 				continue
+			print('Working on : ', k)
 			# set the all on perf
 			scores = self.set_scores(base_zs[k].squeeze().unsqueeze(-1), all_on_perf)
 			module_perfs[k].append(scores)
@@ -330,7 +336,7 @@ class My_Trainer(Trainer):
 				# greedily set this to zero
 				new_v[id_] = 0.0
 				base_zs[k] = new_v.view(orig_shape)
-				this_perf = self.get_mask_perf(base_zs)
+				this_perf = random.uniform(0, 1) #self.get_mask_perf(base_zs)
 				scores = self.set_scores(base_zs[k].squeeze().unsqueeze(-1), this_perf)
 				module_perfs[k].append(scores)
 				# reset this node
@@ -355,48 +361,71 @@ class My_Trainer(Trainer):
 		initial_occupancy = calculate_parameters(self.model)
 		round_ = 0
 		best_perf, module_perfs = -1, None
-		while round_ < self.additional_args.max_prune_rounds:
-			round_ += 1
-			print('Starting Round : ', round_)
-			if self.do_greedy_baseline:
-				best_perf, best_random_mask, module_perfs = self.greedy_construct_module_scores(module_perfs=module_perfs)
-			else:
+		if self.do_greedy_baseline:
+			best_perf, best_random_mask, module_perfs = self.greedy_construct_module_scores(module_perfs=module_perfs)
+			self.module_perfs = module_perfs
+			self.best_random_mask = best_random_mask
+			# do a binary search to find a good reasonable threshold.
+			left_end, right_end = 0.0, 1.0
+			while True:
+				qt = (left_end + right_end)/2
+				base_mask = deepcopy(self.base_zs)
+				_ = self.reset_base_zs_global(module_perfs, base_mask=base_mask, qt=qt)
+				cur_sparsity = self.calculate_model_sparsity(base_mask, initial_occupancy)
+				print('\t', 'Current Sparsity Level : {:.3f}'.format(cur_sparsity))
+				if abs(cur_sparsity - self.additional_args.target_sparsity) < self.acceptable_sparsity_delta:
+					self.best_zs = base_mask
+					break
+				if cur_sparsity < self.additional_args.target_sparsity: # We have not pruned enough. Increase the qt
+					left_end = qt
+				else: # we have pruned too much. Reduce the qt
+					right_end = qt
+				
+				# check if we cant go any further
+				if abs(right_end - left_end) < 0.05:
+					print('breaking early because there is no more we can do')
+					self.best_zs = base_mask
+					break
+		else:
+			while round_ < self.additional_args.max_prune_rounds:
+				round_ += 1
+				print('Starting Round : ', round_)
 				best_perf, best_random_mask, module_perfs = self.construct_module_scores(module_perfs=module_perfs)
 
-			if self.additional_args.do_local_thresholding:
-				this_occ_dict = self.reset_base_zs_local(module_perfs)
-			else:
-				this_occ_dict = self.reset_base_zs_global(module_perfs)
+				if self.additional_args.do_local_thresholding:
+					this_occ_dict = self.reset_base_zs_local(module_perfs)
+				else:
+					this_occ_dict = self.reset_base_zs_global(module_perfs)
 
-			print('\t', ' | '.join(['{}-occupancy : {:.3f}'.format(k, v) for k, v in this_occ_dict.items()]))
-			assert all([occ <= prev_occ_dict[k] for k, occ in this_occ_dict.items()]), 'Occupancy should not increase over time!'
+				print('\t', ' | '.join(['{}-occupancy : {:.3f}'.format(k, v) for k, v in this_occ_dict.items()]))
+				assert all([occ <= prev_occ_dict[k] for k, occ in this_occ_dict.items()]), 'Occupancy should not increase over time!'
 
-			# Get the best mask at the moment
-			cur_best_mask = deepcopy(self.base_zs)
-			for k in self.arch_comp_keys:
-				cur_best_mask[k] *= 2.0
+				# Get the best mask at the moment
+				cur_best_mask = deepcopy(self.base_zs)
+				for k in self.arch_comp_keys:
+					cur_best_mask[k] *= 2.0
 
-			our_perf = self.get_mask_perf(cur_best_mask)
-			print('\t', '[{}] Best Random Perf : {:.3f}. Our Perf : {:.3f}'.format(self.fitness_strategy, best_perf, our_perf))
-			if self.additional_args.fitness_strategy != 'linear_fit':
-				random_perf = self.get_mask_perf(best_random_mask, fitness_strategy='linear_fit') if best_random_mask else None
-				our_perf = self.get_mask_perf(cur_best_mask, fitness_strategy='linear_fit')
-				print('\t', '[Linear Fit]| Best Random Perf : {:.3f}. Our Perf : {:.3f}'.format(random_perf, our_perf))
+				our_perf = self.get_mask_perf(cur_best_mask)
+				print('\t', '[{}] Best Random Perf : {:.3f}. Our Perf : {:.3f}'.format(self.fitness_strategy, best_perf, our_perf))
+				if self.additional_args.fitness_strategy != 'linear_fit':
+					random_perf = self.get_mask_perf(best_random_mask, fitness_strategy='linear_fit') if best_random_mask else None
+					our_perf = self.get_mask_perf(cur_best_mask, fitness_strategy='linear_fit')
+					print('\t', '[Linear Fit]| Best Random Perf : {:.3f}. Our Perf : {:.3f}'.format(random_perf, our_perf))
 
-			# Caching for saving in case this is the last round
-			self.best_random_mask = best_random_mask
-			self.module_perfs = module_perfs
-			self.best_zs = cur_best_mask
+				# Caching for saving in case this is the last round
+				self.best_random_mask = best_random_mask
+				self.module_perfs = module_perfs
+				self.best_zs = cur_best_mask
 
-			cur_sparsity = self.calculate_model_sparsity(cur_best_mask, initial_occupancy)
-			print('\t', 'Current Sparsity Level : {:.3f}'.format(cur_sparsity))
-			if abs(cur_sparsity - self.additional_args.target_sparsity) < self.acceptable_sparsity_delta:
-				break
+				cur_sparsity = self.calculate_model_sparsity(cur_best_mask, initial_occupancy)
+				print('\t', 'Current Sparsity Level : {:.3f}'.format(cur_sparsity))
+				if abs(cur_sparsity - self.additional_args.target_sparsity) < self.acceptable_sparsity_delta:
+					break
 
-			if cur_sparsity > self.additional_args.target_sparsity:
-				print('\t', 'We overshot. Post Hoc Fix with Module Perfs Recommended')
-				break
-			prev_occ_dict = this_occ_dict
+				if cur_sparsity > self.additional_args.target_sparsity:
+					print('\t', 'We overshot. Post Hoc Fix with Module Perfs Recommended')
+					break
+				prev_occ_dict = this_occ_dict
 
 
 	def calculate_model_sparsity(self, mask, initial_occupancy):
