@@ -106,6 +106,7 @@ class My_Trainer(Trainer):
 		self.best_random_mask = None
 
 		self.lagrangian_optimizer = None
+		self.module_perfs = None
 
 		self.start_saving_best = True if self.additional_args.pruning_type is None else False
 
@@ -120,14 +121,7 @@ class My_Trainer(Trainer):
 		
 		# Setup for our method
 		self.arch_comp_keys = ['head_z', 'mlp_z', 'intermediate_z', 'hidden_z']
-		base_zs = self.l0_module.forward(training=False)
-		self.base_zs = {}
-		for k, v in base_zs.items():
-			v_ = v.detach()
-			fill_val = 0.5 if k in self.arch_comp_keys else 1.0
-			v_.zero_().fill_(fill_val)
-			v_.requires_grad = False
-			self.base_zs[k] = v_
+		self.base_zs = self.get_base_zs_init()
 
 		self.acceptable_sparsity_delta = self.additional_args.sparsity_epsilon
 		self.train_batcher = iter(self.get_train_dataloader())
@@ -135,6 +129,17 @@ class My_Trainer(Trainer):
 		self.fitness_strategy = self.additional_args.fitness_strategy
 		self.masks_per_round = self.additional_args.masks_per_round
 		self.do_greedy_baseline = self.additional_args.do_greedy_baseline
+	
+	def get_base_zs_init(self):
+		base_zs = self.l0_module.forward(training=False)
+		result = {}
+		for k, v in base_zs.items():
+			v_ = v.detach()
+			fill_val = 0.5 if k in self.arch_comp_keys else 1.0
+			v_.zero_().fill_(fill_val)
+			v_.requires_grad = False
+			result[k] = v_
+		return result
 
 	def gen_random_mask(self, base_zs=None):
 		base_zs = base_zs if base_zs else self.base_zs
@@ -277,7 +282,7 @@ class My_Trainer(Trainer):
 		scores_save_path = os.path.join(self.args.output_dir, 'module_perfs.pkl') 
 		if os.path.exists(scores_save_path):
 			print('Resetting Initial Based Mask')
-			scores_dict = pkl.load(open(scores_save_path, 'rb'))
+			self.module_perfs = pkl.load(open(scores_save_path, 'rb'))
 			self.best_random_mask = torch.load(os.path.join(self.args.output_dir, "best_random_mask.pt"))
 			self.base_zs = torch.load(os.path.join(self.args.output_dir, "zs.pt"))
 			occupancies = {}
@@ -361,9 +366,13 @@ class My_Trainer(Trainer):
 		round_ = 0
 		best_perf, module_perfs = -1, None
 		if self.do_greedy_baseline:
-			best_perf, best_random_mask, module_perfs = self.greedy_construct_module_scores(module_perfs=module_perfs)
-			self.module_perfs = module_perfs
-			self.best_random_mask = best_random_mask
+			if self.module_perfs is not None:
+				self.base_zs = self.get_base_zs_init()
+				module_perfs = self.module_perfs
+			else:
+				best_perf, best_random_mask, module_perfs = self.greedy_construct_module_scores(module_perfs=module_perfs)
+				self.module_perfs = module_perfs
+				self.best_random_mask = best_random_mask
 			# do a binary search to find a good reasonable threshold.
 			left_end, right_end = 0.0, 1.0
 			while True:
