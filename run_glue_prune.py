@@ -218,7 +218,7 @@ def main():
     
     if additional_args.pretrained_pruned_model is not None:
         zs = load_zs(additional_args.pretrained_pruned_model)
-        model = load_model(additional_args.pretrained_pruned_model, Model, zs, additional_args.reset_LN)
+        model = load_model(additional_args.pretrained_pruned_model, Model, zs, additional_args.reset_LN, additiona_args.random_init)
         print(
             f"Model Size after pruning: {calculate_parameters(model)}")
 

@@ -18,17 +18,19 @@ def initialize_layer_transformation(model):
 		torch.eye(len(model.layer_transformation.weight)))
 	model.layer_transformation.bias.data.fill_(0)
 
-def load_model_with_zs(model_path, model_class, zs=None, reset_LN=False):
+def load_model_with_zs(model_path, model_class, zs=None, reset_LN=False, random_init=False):
 	config_path = os.path.join(model_path, "config.json")
 	if os.path.exists(config_path):
 		config = AutoConfig.from_pretrained(model_path)
 	
-	model = model_class.from_pretrained(model_path, config=config)
-	
-	print('Lucio : -- make sure that if we have implemented backward pass version we need to load the updated weights')
-# 	print('This is After we load')
-# 	pprint({k: v.mean().item() for k, v in model.named_parameters() if 'bias' not in k})
-# 	exit()
+	if random_init:
+		print('Using randomly initialized model')
+		model = model_class(config=config)
+	else:
+		print('Using pretrained model specified here : ', model_path)
+		model = model_class.from_pretrained(model_path, config=config)
+
+	# TODO [ldery] -- NB -- we might need this in the future. 
 # 	p = os.path.join(model_path, "pytorch_model.bin")s
 # 	loaded_weights = torch.load(p, map_location="cpu")
 
