@@ -55,9 +55,9 @@ def load_model_with_zs(model_path, model_class, zs=None, reset_LN=False, random_
 
 	return model
 
-def load_model(model_path, model_class, zs=None, reset_LN=False):
+def load_model(model_path, model_class, zs=None, reset_LN=False, random_init=False):
 	assert zs is not None
-	model = load_model_with_zs(model_path, model_class, zs, reset_LN)
+	model = load_model_with_zs(model_path, model_class, zs, reset_LN, random_init)
 	print(f"Model Size: {calculate_parameters(model)}")
 	return model
 
