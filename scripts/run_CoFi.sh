@@ -18,8 +18,9 @@ code_dir=${proj_dir}
 task_name=$1
 data_dir=$proj_dir/data/glue_data/${task_name}
 
-# pretrain model
+# pretrain model 
 model_name_or_path=${11}
+
 
 # logging & saving
 logging_steps=100
@@ -54,6 +55,14 @@ layer_distill_version=${9}
 
 scheduler_type=linear
 
+# if [[ " ${glue_low[*]} " =~ ${task_name} ]]; then
+#     echo 'In the low-glue area'
+#     eval_steps=50
+#     epochs=50
+#     start_saving_best_epochs=25
+#     prepruning_finetune_epochs=2
+#     lagrangian_warmup_epochs=10
+# fi
 
 if [[ " ${glue_low[*]} " =~ ${task_name} ]]; then
     eval_steps=50

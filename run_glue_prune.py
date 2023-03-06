@@ -215,7 +215,7 @@ def main():
     logger.info(f"Model size: {calculate_parameters(model)}")
 
     zs = None
-    
+
     if additional_args.pretrained_pruned_model is not None:
         zs = load_zs(additional_args.pretrained_pruned_model)
         model = load_model(additional_args.pretrained_pruned_model, Model, zs)
@@ -365,7 +365,7 @@ def main():
     logger.info(
         f"************* {len(eval_dataset)} Evaluation Examples Loaded *************")
 
-
+    
     trainer = CoFiTrainer(
         model=model,
         args=training_args,

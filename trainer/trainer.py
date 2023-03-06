@@ -29,6 +29,7 @@ from transformers.training_args import TrainingArguments
 from args import AdditionalArguments
 from utils.cofi_utils import *
 from utils.utils import *
+import pdb
 
 import wandb
 
@@ -427,6 +428,7 @@ class CoFiTrainer(Trainer):
                 if ii == 0:
                     logger.info(f"Putting zs {zs.keys()} into inputs:")
                 self.fill_inputs_with_zs(zs, inputs) #! use the zs
+#             pdb.set_trace()
             loss, logits, labels = self.prediction_step(
                 model, inputs, prediction_loss_only)
 
