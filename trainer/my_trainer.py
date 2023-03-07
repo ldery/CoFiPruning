@@ -108,6 +108,7 @@ class My_Trainer(Trainer):
 		self.best_random_mask = None
 
 		self.lagrangian_optimizer = None
+		self.kshap_info = None
 
 		self.start_saving_best = True if self.additional_args.pruning_type is None else False
 
@@ -121,7 +122,9 @@ class My_Trainer(Trainer):
 		logger.setLevel(log_level)
 		
 		# Setup for our method
-		self.arch_comp_keys = ['head_z', 'mlp_z', 'hidden_z'] #'intermediate_z'
+		self.arch_comp_keys = ['head_z', 'mlp_z', 'intermediate_z', 'hidden_z']
+		self.separate_keys = ['intermediate_z']
+
 		base_zs = self.l0_module.forward(training=False)
 		self.base_zs = {}
 		for k, v in base_zs.items():
@@ -233,21 +236,39 @@ class My_Trainer(Trainer):
 			pointer += num_active
 		return occupancies
 
-	def reset_base_zs_global(self, kshap_info):
+	def reset_base_zs_global(self, kshap_info, module_perfs):
 		max_min_delta = ( self.num_labels - 1.0) / self.num_labels
 		shapley_values = calculate_result(kshap_info[0], kshap_info[1], max_min_delta)
 
 		threshold = np.quantile(shapley_values, self.additional_args.quantile_cutoff)
 		shapley_bool = shapley_values > threshold
 
+		A = kshap_info[0][shapley_bool, :][:, shapley_bool]
+		b = kshap_info[1][shapley_bool]
+		self.kshap_info = (A, b)
+
 		occupancies = {}
 		pointer = 0
 		for k in self.arch_comp_keys:
-			active_nodes = self.base_zs[k] > 0
-			num_active = active_nodes.sum()
-			self.base_zs[k][active_nodes] = torch.FloatTensor(shapley_bool[pointer : pointer + num_active] / 2.0)
+			if k not in self.separate_keys:
+				active_nodes = self.base_zs[k] > 0
+				num_active = active_nodes.sum()
+				self.base_zs[k][active_nodes] = torch.FloatTensor(shapley_bool[pointer : pointer + num_active] / 2.0)
+				pointer += num_active
+			else:
+				# Doing a local selection here
+				scores = np.array(module_perfs[k])
+				scores[scores < 0] = np.NaN
+				scores = np.nanmean(scores, axis=0)
+				scores = scores[:, :, 0] - scores[:, :, 1]
+				chosen = (scores[self.base_zs[k].squeeze() > 0]).flatten()
+				chosen = chosen[~np.isnan(chosen)]
+				threshold = np.quantile(chosen, self.additional_args.quantile_cutoff)
+				mask = torch.tensor(scores > threshold).float()
+				mask = mask.unsqueeze(1).unsqueeze(1)
+
+				self.base_zs[k] *= mask
 			occupancies[k] = (self.base_zs[k] * 2.0).mean().item() # Because we have 0.5 as the bernoulli probability
-			pointer += num_active
 		return occupancies
 
 	def check_and_retrieve_past_runs(self):
@@ -267,12 +288,14 @@ class My_Trainer(Trainer):
 	def mask_to_bool_vec(self, mask):
 		this_vec = []
 		for k in self.arch_comp_keys:
+			if k in self.separate_keys:
+				continue
 			result = torch.masked_select(mask[k], self.base_zs[k] > 0)
 			this_vec.append(result)
 		return torch.concat(this_vec)
 
-
-	def construct_module_scores(self, paired=False):
+	def construct_module_scores(self, paired=False, module_perfs=None):
+		module_perfs = defaultdict(list) if module_perfs is None else module_perfs
 		best_perf_so_far, best_random_mask = -1.0, None
 
 		num_iters = int(self.masks_per_round / 2) if paired else self.masks_per_round
@@ -296,6 +319,11 @@ class My_Trainer(Trainer):
 				this_bool_mat = this_bool_vec.outer(this_bool_vec) / num_iters
 				boolean_mats[p_id] = this_bool_mat + boolean_mats[p_id] if (idx_ != 0) else this_bool_mat
 
+				# Do some storage for the special key
+				for k in self.separate_keys:
+					scores = self.set_scores(cur_mask[k].squeeze().unsqueeze(-1), this_perf)
+					module_perfs[k].append(scores)
+
 				if this_perf > best_perf_so_far:
 					best_perf_so_far = this_perf
 					best_random_mask = cur_mask
@@ -303,7 +331,7 @@ class My_Trainer(Trainer):
 		kshap_info = boolean_mats[0].cpu().numpy(), bool_vecs[0].cpu().numpy()
 		if paired:
 			kshap_info = (kshap_info[0] + boolean_mats[1].cpu().numpy()) / 2.0, (kshap_info[1] + bool_vecs[0].cpu().numpy()) / 2.0,
-		return best_perf_so_far, best_random_mask, kshap_info
+		return best_perf_so_far, best_random_mask, kshap_info, module_perfs
 
 	def train(self):
 		# TODO[ldery] - go from hard-coded value
@@ -315,15 +343,22 @@ class My_Trainer(Trainer):
 
 		initial_occupancy = calculate_parameters(self.model)
 		round_ = 0
-		best_perf = -1
+		best_perf, module_perfs = -1, None
 		while round_ < self.additional_args.max_prune_rounds:
 			round_ += 1
 			print('Starting Round : ', round_)
-			best_perf, best_random_mask, kshap_info = self.construct_module_scores()
-			if self.additional_args.do_local_thresholding:
-				this_occ_dict = self.reset_base_zs_local(kshap_info)
+			best_perf, best_random_mask, kshap_info, module_perfs = self.construct_module_scores(module_perfs=module_perfs)
+			if self.kshap_info is not None:
+				A = (self.kshap_info[0]*(round_ - 1) + kshap_info[0]) / round_
+				b = (self.kshap_info[1]*(round_ - 1) + kshap_info[1]) / round_
+				self.kshap_info = A, b
 			else:
-				this_occ_dict = self.reset_base_zs_global(kshap_info)
+				self.kshap_info = kshap_info
+
+			if self.additional_args.do_local_thresholding:
+				this_occ_dict = self.reset_base_zs_local(self.kshap_info)
+			else:
+				this_occ_dict = self.reset_base_zs_global(self.kshap_info, module_perfs)
 
 			print('\t', ' | '.join(['{}-occupancy : {:.3f}'.format(k, v) for k, v in this_occ_dict.items()]))
 			assert all([occ <= prev_occ_dict[k] for k, occ in this_occ_dict.items()]), 'Occupancy should not increase over time!'
