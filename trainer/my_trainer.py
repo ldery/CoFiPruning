@@ -37,7 +37,7 @@ from utils.cofi_utils import *
 from utils.utils import *
 from torch.nn import CrossEntropyLoss
 import random
-from .kernelshap import calculate_result
+from .scoring_model import *
 
 import wandb
 import pdb
@@ -123,13 +123,16 @@ class My_Trainer(Trainer):
 		
 		# Setup for our method
 		self.arch_comp_keys = ['head_z', 'mlp_z', 'intermediate_z', 'hidden_z']
-		self.separate_keys = ['intermediate_z']
 
 		base_zs = self.l0_module.forward(training=False)
 		self.base_zs = {}
+		num_players = 0
 		for k, v in base_zs.items():
 			v_ = v.detach()
-			fill_val = 0.5 if k in self.arch_comp_keys else 1.0
+			fill_val = 1.0
+			if k in self.arch_comp_keys:
+				fill_val = 0.5
+				num_players += v_.numel()
 			v_.zero_().fill_(fill_val)
 			v_.requires_grad = False
 			self.base_zs[k] = v_
@@ -139,6 +142,9 @@ class My_Trainer(Trainer):
 		self.val_batcher = iter(self.get_eval_dataloader())
 		self.fitness_strategy = self.additional_args.fitness_strategy
 		self.masks_per_round = self.additional_args.masks_per_round
+		
+		# Setup the scoring model here
+		self.scoring_model = get_score_model(num_players=num_players, model_type='logistic_regression')
 
 	def gen_random_mask(self, paired=False):
 		mask = {}
@@ -216,59 +222,43 @@ class My_Trainer(Trainer):
 			normalized_scores = normalized_scores[:, 0] - normalized_scores[:, 1]
 		return normalized_scores
 
-	def reset_base_zs_local(self, kshap_info):
-		max_min_delta = ( self.num_labels - 1.0) / self.num_labels
-		shapley_values = calculate_result(kshap_info[0], kshap_info[1], max_min_delta)
+	def reset_base_zs_local(self):
+		shapley_values = self.scoring_model.get_scores().cpu().squeeze()
 
 		occupancies = {}
 		pointer = 0
-
 		for k in self.arch_comp_keys:
-			active_nodes = self.base_zs[k] > 0
-			num_active = active_nodes.sum()
-			
-			shapley_subset = shapley_values[pointer : pointer + num_active]
-			threshold = np.quantile(shapley_subset, self.additional_args.quantile_cutoff)
-			shapley_bool = shapley_subset > threshold
-			
-			self.base_zs[k][active_nodes] = torch.FloatTensor(shapley_bool / 2.0)
+			numel_ = self.base_zs[k].numel()
+			orig_shape = self.base_zs[k].shape
+			this_shap = shapley_values[pointer : pointer + numel_]
+			active_shapley = this_shap[(self.base_zs[k].view(-1)  > 0)]
+			threshold = np.quantile(active_shapley, self.additional_args.quantile_cutoff)
+
+			shapley_bool = (self.base_zs[k].view(-1)  > 0) * (this_shap > threshold)
+			self.base_zs[k] = (shapley_bool * 1.0 / 2.0).view(orig_shape)
 			occupancies[k] = (self.base_zs[k] * 2.0).mean().item() # Because we have 0.5 as the bernoulli probability
-			pointer += num_active
+			pointer += numel_
 		return occupancies
 
-	def reset_base_zs_global(self, kshap_info, module_perfs):
-		max_min_delta = ( self.num_labels - 1.0) / self.num_labels
-		shapley_values = calculate_result(kshap_info[0], kshap_info[1], max_min_delta)
+	def reset_base_zs_global(self):
+		shapley_values = self.scoring_model.get_scores().cpu().squeeze()
+		# only get the active nodes
+		all_active_nodes = self.mask_to_bool_vec(self.base_zs, only_active=False)
+		active_shapley = (shapley_values[all_active_nodes > 0]).numpy()
 
-		threshold = np.quantile(shapley_values, self.additional_args.quantile_cutoff)
-		shapley_bool = shapley_values > threshold
-
-		A = kshap_info[0][shapley_bool, :][:, shapley_bool]
-		b = kshap_info[1][shapley_bool]
-		self.kshap_info = (A, b)
+		# Get the surviving nodes
+		threshold = np.quantile(active_shapley, self.additional_args.quantile_cutoff)
+		shapley_bool = (shapley_values > threshold) * all_active_nodes * 2 # to account for all active nodes being 0.5
 
 		occupancies = {}
 		pointer = 0
 		for k in self.arch_comp_keys:
-			if k not in self.separate_keys:
-				active_nodes = self.base_zs[k] > 0
-				num_active = active_nodes.sum()
-				self.base_zs[k][active_nodes] = torch.FloatTensor(shapley_bool[pointer : pointer + num_active] / 2.0)
-				pointer += num_active
-			else:
-				# Doing a local selection here
-				scores = np.array(module_perfs[k])
-				scores[scores < 0] = np.NaN
-				scores = np.nanmean(scores, axis=0)
-				scores = scores[:, :, 0] - scores[:, :, 1]
-				chosen = (scores[self.base_zs[k].squeeze() > 0]).flatten()
-				chosen = chosen[~np.isnan(chosen)]
-				threshold = np.quantile(chosen, self.additional_args.quantile_cutoff)
-				mask = torch.tensor(scores > threshold).float()
-				mask = mask.unsqueeze(1).unsqueeze(1)
+			numel_ = self.base_zs[k].numel()
+			orig_shape = self.base_zs[k].shape
+			self.base_zs[k] = (torch.FloatTensor(shapley_bool[pointer : pointer + numel_]) / 2.0).view(orig_shape)
 
-				self.base_zs[k] *= mask
 			occupancies[k] = (self.base_zs[k] * 2.0).mean().item() # Because we have 0.5 as the bernoulli probability
+			pointer += numel_
 		return occupancies
 
 	def check_and_retrieve_past_runs(self):
@@ -285,23 +275,22 @@ class My_Trainer(Trainer):
 			return occupancies
 		return {k: 1.0 for k in self.arch_comp_keys}
 
-	def mask_to_bool_vec(self, mask):
+	def mask_to_bool_vec(self, mask, only_active=True):
 		this_vec = []
 		for k in self.arch_comp_keys:
-			if k in self.separate_keys:
-				continue
-			result = torch.masked_select(mask[k], self.base_zs[k] > 0)
+			if only_active:
+				result = torch.masked_select(mask[k], self.base_zs[k] > 0)
+			else:
+				result = mask[k].view(-1)
 			this_vec.append(result)
 		return torch.concat(this_vec)
 
-	def construct_module_scores(self, paired=False, module_perfs=None):
-		module_perfs = defaultdict(list) if module_perfs is None else module_perfs
+	def construct_module_scores(self, paired=False):
 		best_perf_so_far, best_random_mask = -1.0, None
 
 		num_iters = int(self.masks_per_round / 2) if paired else self.masks_per_round
-		# For kernel shap estimates
-		null_perf = 1.0 / self.num_labels
-		boolean_mats, bool_vecs = [None, None], [None, None]
+
+		bool_vecs, scores = [], []
 		for idx_ in tqdm(range(num_iters)):
 			pair = self.gen_random_mask(paired=paired)
 			for p_id, cur_mask in enumerate(pair):
@@ -311,27 +300,14 @@ class My_Trainer(Trainer):
 					this_perf = self.get_mask_perf(cur_mask)
 
 				# convert mask to boolean vector
-				this_bool_vec = self.mask_to_bool_vec(cur_mask)
-
-				vec_entry = this_bool_vec * (this_perf - null_perf) / num_iters
-				bool_vecs[p_id] = vec_entry + bool_vecs[p_id] if (idx_ != 0) else vec_entry
-
-				this_bool_mat = this_bool_vec.outer(this_bool_vec) / num_iters
-				boolean_mats[p_id] = this_bool_mat + boolean_mats[p_id] if (idx_ != 0) else this_bool_mat
-
-				# Do some storage for the special key
-				for k in self.separate_keys:
-					scores = self.set_scores(cur_mask[k].squeeze().unsqueeze(-1), this_perf)
-					module_perfs[k].append(scores)
+				bool_vecs.append(self.mask_to_bool_vec(cur_mask, only_active=False))
+				scores.append(this_perf)
 
 				if this_perf > best_perf_so_far:
 					best_perf_so_far = this_perf
 					best_random_mask = cur_mask
 
-		kshap_info = boolean_mats[0].cpu().numpy(), bool_vecs[0].cpu().numpy()
-		if paired:
-			kshap_info = (kshap_info[0] + boolean_mats[1].cpu().numpy()) / 2.0, (kshap_info[1] + bool_vecs[0].cpu().numpy()) / 2.0,
-		return best_perf_so_far, best_random_mask, kshap_info, module_perfs
+		return best_perf_so_far, best_random_mask, (bool_vecs, scores)
 
 	def train(self):
 		# TODO[ldery] - go from hard-coded value
@@ -347,18 +323,13 @@ class My_Trainer(Trainer):
 		while round_ < self.additional_args.max_prune_rounds:
 			round_ += 1
 			print('Starting Round : ', round_)
-			best_perf, best_random_mask, kshap_info, module_perfs = self.construct_module_scores(module_perfs=module_perfs)
-			if self.kshap_info is not None:
-				A = (self.kshap_info[0]*(round_ - 1) + kshap_info[0]) / round_
-				b = (self.kshap_info[1]*(round_ - 1) + kshap_info[1]) / round_
-				self.kshap_info = A, b
-			else:
-				self.kshap_info = kshap_info
+			best_perf, best_random_mask, scoring_model_info = self.construct_module_scores()
+			self.scoring_model.update_with_info(scoring_model_info)
 
 			if self.additional_args.do_local_thresholding:
-				this_occ_dict = self.reset_base_zs_local(self.kshap_info)
+				this_occ_dict = self.reset_base_zs_local()
 			else:
-				this_occ_dict = self.reset_base_zs_global(self.kshap_info, module_perfs)
+				this_occ_dict = self.reset_base_zs_global()
 
 			print('\t', ' | '.join(['{}-occupancy : {:.3f}'.format(k, v) for k, v in this_occ_dict.items()]))
 			assert all([occ <= prev_occ_dict[k] for k, occ in this_occ_dict.items()]), 'Occupancy should not increase over time!'
