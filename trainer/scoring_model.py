@@ -39,13 +39,13 @@ class Buffer(object):
 		proba = np.arange(len_) + 1
 		proba = proba / proba.sum()
 		chosen = np.random.choice(len_, size=n_samples, replace=False, p=proba)
-		for i_ in chosen:
+		for i in chosen:
 			result[0].append(self.buffer[0][i])
 			result[1].append(self.buffer[1][i])
 		return result
 
 
-def create_tensor(shape, zero_out=1.0, requires_grad=True, is_cuda=True):
+def create_tensor(shape, requires_grad=True, is_cuda=True):
 	inits = torch.zeros(*shape)
 	# Create the weights
 	weights = inits.float().cuda() if is_cuda else inits.float()
@@ -63,14 +63,15 @@ class LogisticReg(nn.Module):
 		self.num_players = num_players
 		
 		self.score_tensor = create_tensor((num_players, 1))
-		self.intercept = create_tensor((1, 1),zero_out=0)
+		self.intercept = create_tensor((1, 1))
 
 		self.optim = Adam([self.score_tensor, self.intercept], lr=training_config['lr'])
 		self.loss_fn = nn.MSELoss()
 		self.reg_fn =  nn.L1Loss() 
 		self.l1_weight = training_config['l1_weight']
 		self.scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-			self.optim, factor=training_config['patience_factor'], patience=training_config['patience']
+			self.optim, factor=training_config['patience_factor'], patience=training_config['patience'],
+			verbose=True
 		)
 		self.buffer = Buffer()
 
@@ -85,6 +86,7 @@ class LogisticReg(nn.Module):
 		mask_tensors = torch.stack(mask_tensors).to(self.score_tensor.device)
 		scores = torch.tensor(scores).to(self.score_tensor.device)
 		num_masks = len(mask_tensors)
+		max_error, min_error = -1, 1
 		for epoch_ in range(training_config['nepochs']):
 			# generate a permutation
 			perm = np.random.permutation(num_masks)
@@ -97,6 +99,14 @@ class LogisticReg(nn.Module):
 				ys = scores[perm[start_:end_]].view(-1, 1)
 				preds = torch.matmul(xs, self.score_tensor) + self.intercept
 				mse_loss = self.loss_fn(preds, ys)
+			 
+				with torch.no_grad():
+					errors = (preds - ys).abs()
+					this_max_error = errors.max().item()
+					this_min_error = errors.min().item()
+				max_error = max(max_error, this_max_error)
+				min_error = min(min_error, this_min_error)
+
 				l1loss = self.reg_fn(self.score_tensor, torch.zeros_like(self.score_tensor))
 				loss = mse_loss + (self.l1_weight * l1loss)
 
@@ -107,7 +117,7 @@ class LogisticReg(nn.Module):
 				running_loss_avg += loss.item()
 			running_loss_avg /= n_batches
 			self.scheduler.step(running_loss_avg)
-			print('Epoch {} : Loss : {:.5f}'.format(epoch_, running_loss_avg))
+			print('Epoch {} | Loss : {:.5f} | Max Error : {:.5f} | Min Error : {:.5f}'.format(epoch_, running_loss_avg, max_error, min_error))
 
 
 	def get_scores(self):
