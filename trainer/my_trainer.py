@@ -144,7 +144,11 @@ class My_Trainer(Trainer):
 		self.masks_per_round = self.additional_args.masks_per_round
 		
 		# Setup the scoring model here
-		self.scoring_model = get_score_model(num_players=num_players, model_type='logistic_regression')
+		base_zs_clone = {}
+		for k in self.arch_comp_keys:
+			base_zs_clone[k] = self.base_zs[k]
+		self.scoring_model = get_score_model(base_zs_clone, num_layers=self.nlayers, num_players=num_players, model_type='non-linear')
+		self.scoring_model.cuda()
 
 	def gen_random_mask(self, paired=False):
 		mask = {}
@@ -223,7 +227,10 @@ class My_Trainer(Trainer):
 		return normalized_scores
 
 	def reset_base_zs_local(self):
-		shapley_values = self.scoring_model.get_scores().cpu().squeeze()
+		base_zs_clone = {}
+		for k in self.arch_comp_keys:
+			base_zs_clone[k] = self.base_zs[k]
+		shapley_values = self.scoring_model.get_scores(base_zs_clone).cpu().squeeze()
 
 		occupancies = {}
 		pointer = 0
@@ -241,7 +248,10 @@ class My_Trainer(Trainer):
 		return occupancies
 
 	def reset_base_zs_global(self):
-		shapley_values = self.scoring_model.get_scores().cpu().squeeze()
+		base_zs_clone = {}
+		for k in self.arch_comp_keys:
+			base_zs_clone[k] = self.base_zs[k]
+		shapley_values = self.scoring_model.get_scores(base_zs_clone).cpu().squeeze()
 		# only get the active nodes
 		all_active_nodes = self.mask_to_bool_vec(self.base_zs, only_active=False)
 		active_shapley = (shapley_values[all_active_nodes > 0]).numpy()
@@ -300,7 +310,10 @@ class My_Trainer(Trainer):
 					this_perf = self.get_mask_perf(cur_mask)
 
 				# convert mask to boolean vector
-				bool_vecs.append(self.mask_to_bool_vec(cur_mask, only_active=False))
+				mask_clone = {}
+				for k in self.arch_comp_keys:
+					mask_clone[k] = cur_mask[k]
+				bool_vecs.append(self.scoring_model.config_to_model_info(mask_clone))
 				scores.append(this_perf)
 
 				if this_perf > best_perf_so_far:
