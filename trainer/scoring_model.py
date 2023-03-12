@@ -13,16 +13,9 @@ training_config = {
 	'nepochs' : 5
 }
 
-# Best config
-# training_config = {
-# 	'lr' : 1e-4,
-# 	'bsz' : 16,
-# 	'nepochs' : 5
-# }
-
 
 def create_tensor(shape, zero_out=1.0, requires_grad=True, is_cuda=True):
-	inits = torch.zeros(*shape) #.uniform_(-1/shape[0], 1/shape[0]) * zero_out
+	inits = torch.zeros(*shape)
 	# Create the weights
 	weights = inits.float().cuda() if is_cuda else inits.float()
 	if requires_grad:
@@ -42,7 +35,7 @@ class LogisticReg(nn.Module):
 		self.intercept = create_tensor((1, 1),zero_out=0)
 
 		self.optim = Adam([self.score_tensor, self.intercept], lr=training_config['lr'])
-		self.loss_fn = nn.MSELoss() #reduction='none')
+		self.loss_fn = nn.MSELoss()
 		self.reg_fn =  nn.L1Loss() 
 		self.l1_weight = 10
 
@@ -66,7 +59,7 @@ class LogisticReg(nn.Module):
 				mse_loss = self.loss_fn(preds, ys)
 				l1loss = self.reg_fn(self.score_tensor, torch.zeros_like(self.score_tensor))
 				loss = mse_loss + (self.l1_weight * l1loss)
-				print(mse_loss.item(), l1loss.item(), self.l1_weight)
+
 				loss.backward()
 # 				print(preds)
 # 				print('Grad max : ', torch.max(self.score_tensor.grad), 'Intercept Norm : ',  torch.norm(self.intercept.grad))
