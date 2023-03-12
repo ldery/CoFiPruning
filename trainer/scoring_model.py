@@ -10,7 +10,7 @@ from tqdm import tqdm
 from utils import *
 
 training_config = {
-	'lr' : 1e-3,
+	'lr' : 1e-4,
 	'bsz' : 16,
 	'nepochs' : 5,
 	'd_in': 5,
@@ -58,20 +58,22 @@ class NonLinearModel(nn.Module):
 		self.featurizer = nn.Sequential(
 			nn.Dropout(training_config['dp_prob']),
 			nn.ReLU(),
-			nn.Linear(input_embed_dim, 5 * hidden_sz),
+			nn.Linear(input_embed_dim, 5 * hidden_sz, bias=False),
 			nn.ReLU(),
-			nn.Linear(5 * hidden_sz, hidden_sz),
+			nn.Linear(5 * hidden_sz, hidden_sz, bias=False),
 			nn.Dropout(training_config['dp_prob']),
+			nn.ReLU(),
 		)
-		
-		self.predictor = nn.Sequential(
+		self.individual_predictor = nn.Parameter(nn.init.uniform_(torch.zeros(1, 1, hidden_sz), -1e-5, 1e-5))
+		self.individual_predictor.requires_grad = True
+
+		self.joint_predictor = nn.Sequential(
 			nn.Linear(hidden_sz, int(hidden_sz / 2)),
 			nn.ReLU(),
 			nn.Linear(int(hidden_sz / 2), 1)
 		)
-		
-		# Init the predictor last layer to 0.5 as a good init
-		for k, v in self.predictor.named_parameters():
+
+		for k, v in self.joint_predictor.named_parameters():
 			if k == '2.bias':
 				with torch.no_grad():
 					v.fill_(0.5)
@@ -81,7 +83,8 @@ class NonLinearModel(nn.Module):
 			{'params': self.module_type_embed.parameters()},
 			{'params': self.module_embed.parameters()},
 			{'params': self.featurizer.parameters()},
-			{'params': self.predictor.parameters()},
+			{'params': self.individual_predictor},
+			{'params': self.joint_predictor.parameters()},
 		]
 		self.optim = Adam(parameters, lr=training_config['lr'])
 		self.loss_fn = nn.MSELoss()
@@ -126,13 +129,17 @@ class NonLinearModel(nn.Module):
 		return layers, m_types, modules
 
 
-	def forward(self, xs):
+	def forward(self, xs, add_joint=True):
 		input_embeds =  self.layer_id_embed(xs[0]) + self.module_type_embed(xs[1]) + self.module_embed(xs[2])
 		featurized = self.featurizer(input_embeds) # B x S x d
-		# Sum across the element axes.
-		featurized = featurized.mean(axis=1) # B x d
-		predictions = self.predictor(featurized)
-		return predictions
+
+		invidividual_preds = (self.individual_predictor * featurized).sum(axis=-1) # B x S x 1
+		invidividual_preds = invidividual_preds.sum(axis=-1, keepdim=True)
+
+		if add_joint:
+			joint_residuals = self.joint_predictor(featurized.mean(axis=1))
+			return invidividual_preds + joint_residuals
+		return invidividual_preds
 
 	def get_scores(self, base_mask):
 		self.eval()
@@ -148,7 +155,7 @@ class NonLinearModel(nn.Module):
 				this_mtypes = m_types[start_: end_].view(-1, 1)
 				this_modules = modules[start_: end_].view(-1, 1)
 				# get the predictions
-				this_predictions = self.forward([this_layers.cuda(), this_mtypes.cuda(), this_modules.cuda()])
+				this_predictions = self.forward([this_layers.cuda(), this_mtypes.cuda(), this_modules.cuda()], add_joint=False)
 				predictions.append(this_predictions)
 
 		self.train()
@@ -185,7 +192,6 @@ class NonLinearModel(nn.Module):
 				this_ys = ys[perm[start_:end_]].view(-1, 1)
 				# do the forward pass here
 				preds = self.forward(this_xs)
-
 				loss = self.loss_fn(preds, this_ys)
 				loss.backward()
 # 				print(preds)
