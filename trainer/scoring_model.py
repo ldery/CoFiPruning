@@ -12,7 +12,7 @@ training_config = {
 	'bsz' : 16,
 	'nepochs' : 5,
 	'l1_weight': 0,
-	'patience': 20,
+	'patience': 5,
 	'patience_factor': 0.5
 }
 
@@ -35,7 +35,7 @@ class Buffer(object):
 		len_ = self.size()
 		result = [[], []]
 		if len_ < n_samples:
-			return result
+			n_samples = len_
 		proba = np.arange(len_) + 1
 		proba = proba / proba.sum()
 		chosen = np.random.choice(len_, size=n_samples, replace=False, p=proba)
