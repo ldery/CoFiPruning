@@ -13,18 +13,41 @@ training_config = {
 	'lr' : 1e-4,
 	'bsz' : 16,
 	'nepochs' : 5,
+	'l1_weight': 0,
 	'd_in': 5,
 	'd_rep': 10,
 	'dp_prob': 0.1,
+	'patience': 5,
+	'patience_factor': 0.5
 }
 
-# Best config
-# training_config = {
-# 	'lr' : 1e-4,
-# 	'bsz' : 16,
-# 	'nepochs' : 5
-# }
+class Buffer(object):
+	def __init__(self, max_size=500):
+		self.max_size = max_size
+		self.buffer = [[], []] 
+	
+	def size(self):
+		return len(self.buffer[0])
 
+	def add_to_buffer(self, x, y):
+		self.buffer[0].extend(x)
+		self.buffer[1].extend(y)
+		if len(self.buffer[0]) > self.max_size:
+			self.buffer[0] = self.buffer[0][-self.max_size:]
+			self.buffer[1] = self.buffer[1][-self.max_size:]
+
+	def sample(self, n_samples):
+		len_ = self.size()
+		result = [[], []]
+		if n_samples > len_:
+			return self.buffer
+		proba = np.arange(len_) + 1
+		proba = proba / proba.sum()
+		chosen = np.random.choice(len_, size=n_samples, replace=False, p=proba)
+		for i in chosen:
+			result[0].append(self.buffer[0][i])
+			result[1].append(self.buffer[1][i])
+		return result
 
 def create_tensor(shape, zero_out=1.0, requires_grad=True, is_cuda=True):
 	inits = torch.zeros(*shape) #.uniform_(-1/shape[0], 1/shape[0]) * zero_out
@@ -59,15 +82,15 @@ class NonLinearModel(nn.Module):
 			nn.Dropout(training_config['dp_prob']),
 			nn.ReLU(),
 			nn.Linear(input_embed_dim, 5 * hidden_sz, bias=False),
-			nn.ReLU(),
-			nn.Linear(5 * hidden_sz, hidden_sz, bias=False),
 			nn.Dropout(training_config['dp_prob']),
 			nn.ReLU(),
+			nn.Linear(5 * hidden_sz, hidden_sz, bias=False),
 		)
 		self.individual_predictor = nn.Parameter(nn.init.uniform_(torch.zeros(1, 1, hidden_sz), -1e-5, 1e-5))
 		self.individual_predictor.requires_grad = True
 
 		self.joint_predictor = nn.Sequential(
+			nn.ReLU(),
 			nn.Linear(hidden_sz, int(hidden_sz / 2)),
 			nn.ReLU(),
 			nn.Linear(int(hidden_sz / 2), 1)
@@ -88,6 +111,12 @@ class NonLinearModel(nn.Module):
 		]
 		self.optim = Adam(parameters, lr=training_config['lr'])
 		self.loss_fn = nn.MSELoss()
+
+		self.scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+			self.optim, factor=training_config['patience_factor'], patience=training_config['patience'],
+			verbose=True
+		)
+		self.buffer = Buffer()
 
 	def setup_vectors(self, base_mask, num_layers):
 		# Do a 1 time computation to set things up
@@ -176,8 +205,16 @@ class NonLinearModel(nn.Module):
 		return [x.cuda() for x in new_xs]
 
 	def update_with_info(self, run_info):
-		xs, ys = run_info
-		ys = torch.tensor(ys).cuda()
+		xs, og_ys = run_info
+
+		replay_xs, replay_ys = self.buffer.sample(len(xs))
+		xs.extend(replay_xs)
+		og_ys.extend(replay_ys)
+
+		print(len(replay_xs), len(replay_ys))
+
+		ys = torch.tensor(og_ys).cuda()
+		max_error, min_error = -1, 1
 		for epoch_ in range(training_config['nepochs']):
 			# generate a permutation
 			perm = np.random.permutation(len(ys))
@@ -186,21 +223,29 @@ class NonLinearModel(nn.Module):
 			for batch_id in range(n_batches):
 				start_, end_ = int(training_config['bsz'] * batch_id), int(training_config['bsz'] * (batch_id + 1))
 				this_xs = [xs[i_] for i_ in perm[start_:end_]]
+
 				# We have to do smart padding here
 				this_xs = self.pad_sequence(this_xs)
-
 				this_ys = ys[perm[start_:end_]].view(-1, 1)
 				# do the forward pass here
 				preds = self.forward(this_xs)
+				# Do some logging here
+				with torch.no_grad():
+					errors = (preds - this_ys).abs()
+					this_max_error = errors.max().item()
+					this_min_error = errors.min().item()
+				max_error = max(max_error, this_max_error)
+				min_error = min(min_error, this_min_error)
+				
 				loss = self.loss_fn(preds, this_ys)
 				loss.backward()
-# 				print(preds)
-# 				print('Grad max : ', torch.max(self.score_tensor.grad), 'Intercept Norm : ',  torch.norm(self.intercept.grad))
 				self.optim.step()
 				self.optim.zero_grad()
 				running_loss_avg += loss.item()
 			running_loss_avg /= n_batches
-			print('Epoch {} : Loss : {:.5f}'.format(epoch_, running_loss_avg))
+			self.scheduler.step(running_loss_avg)
+			print('Epoch {} | Loss : {:.5f} | Max Error : {:.5f} | Min Error : {:.5f}'.format(epoch_, running_loss_avg, max_error, min_error))
+		self.buffer.add_to_buffer(xs, og_ys)
 
 
 			
