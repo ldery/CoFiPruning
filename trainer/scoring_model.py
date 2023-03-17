@@ -1,6 +1,6 @@
 import torch
 import torch.nn as nn
-from torch.optim import Adam
+from torch.optim import Adam, SGD
 import torch.nn.functional as F
 import numpy as np
 import math
@@ -8,13 +8,19 @@ from scipy.special import comb
 import pdb
 from tqdm import tqdm
 from utils import *
+from pprint import pprint
+from copy import deepcopy
+from torch.nn.init import kaiming_normal_
+
 
 training_config = {
-	'lr' : 1e-4,
+	'lr' : 5e-5,
 	'bsz' : 16,
-	'nepochs' : 5,
+	'nepochs' : 10,
 	'l1_weight': 0,
-	'd_in': 5,
+# 	'd_in': 10,
+# 	'd_rep': 100,
+	'd_in': 3,
 	'd_rep': 10,
 	'dp_prob': 0.1,
 	'patience': 5,
@@ -61,12 +67,22 @@ def get_score_model(config, num_layers, num_players, model_type):
 	if model_type == 'logistic_regression':
 		return LogisticReg(num_players=num_players)
 	elif model_type == 'non-linear':
-		return NonLinearModel(config, num_layers=num_layers)
+		return ScoreModel(config, num_layers=num_layers, num_players=num_players)
 
-class NonLinearModel(nn.Module):
-	def __init__(self, module_config, num_layers=12):
-		super(NonLinearModel, self).__init__()
 
+# Weight initialization
+def weight_init_fn(init_bias):
+	def fn(layer):
+		if isinstance(layer, nn.Linear):
+			layer.weight.data.normal_(std=1e-3)
+	# 		kaiming_normal_(layer.weight, mode='fan_out', nonlinearity='relu')
+			if layer.bias is not None:
+				layer.bias.data.fill_(init_bias)
+	return fn
+
+class MixedLinearModel(nn.Module):
+	def __init__(self, module_config, num_layers, num_players):
+		super(MixedLinearModel, self).__init__()
 		# Initialize the embeddings
 		input_embed_dim = training_config['d_in']
 		self.layer_id_embed = nn.Embedding(num_layers + 2, input_embed_dim, padding_idx=0) # Adding plus 1 because we are considering the model embed as a layer.
@@ -74,49 +90,48 @@ class NonLinearModel(nn.Module):
 		num_modules = sum([v.numel() for k, v in module_config.items()])
 		self.module_embed = nn.Embedding(num_modules + 1, input_embed_dim, padding_idx=0) # + 1 for the padding
 
-		self.setup_vectors(module_config, num_layers)
+		self.score_tensor = nn.parameter.Parameter(create_tensor((num_players, 1)))
 
 		# Member featurizer
 		hidden_sz = training_config['d_rep']
 		self.featurizer = nn.Sequential(
+			nn.ReLU(),
+			nn.Linear(input_embed_dim, hidden_sz),
 			nn.Dropout(training_config['dp_prob']),
 			nn.ReLU(),
-			nn.Linear(input_embed_dim, 5 * hidden_sz, bias=False),
-			nn.Dropout(training_config['dp_prob']),
-			nn.ReLU(),
-			nn.Linear(5 * hidden_sz, hidden_sz, bias=False),
 		)
-		self.individual_predictor = nn.Parameter(nn.init.uniform_(torch.zeros(1, 1, hidden_sz), -1e-5, 1e-5))
-		self.individual_predictor.requires_grad = True
-
+		self.featurizer.apply(weight_init_fn(0.0))
 		self.joint_predictor = nn.Sequential(
-			nn.ReLU(),
-			nn.Linear(hidden_sz, int(hidden_sz / 2)),
-			nn.ReLU(),
-			nn.Linear(int(hidden_sz / 2), 1)
+			nn.Linear(hidden_sz, 1),
 		)
+		self.joint_predictor.apply(weight_init_fn(0.5))
 
-		for k, v in self.joint_predictor.named_parameters():
-			if k == '2.bias':
-				with torch.no_grad():
-					v.fill_(0.5)
+	def forward(self, xs):
+		individual_preds = torch.matmul(xs[-1], self.score_tensor)
+		input_embeds =  self.layer_id_embed(xs[0]) + self.module_type_embed(xs[1]) + self.module_embed(xs[2])
+		features = self.featurizer(input_embeds)
+		pad_mask = (xs[0] > 0).unsqueeze(-1).float()
+		features = (features * pad_mask).sum(axis=1) / pad_mask.sum(axis=1)
+		joint_preds = self.joint_predictor(features)
+		return individual_preds , joint_preds
+	
+	def get_scores(self):
+		with torch.no_grad():
+			predictions = self.score_tensor.detach()
+		stats = predictions.mean().item(), predictions.std().item(), predictions.max().item(), predictions.min().item()
+		print("Predictions Stats : Mean {:.7f}, Std {:.7f}, Max {:.7f}, Min {:.7f}".format(*stats))
+		return predictions
 
-		parameters = [
-			{'params': self.layer_id_embed.parameters()},
-			{'params': self.module_type_embed.parameters()},
-			{'params': self.module_embed.parameters()},
-			{'params': self.featurizer.parameters()},
-			{'params': self.individual_predictor},
-			{'params': self.joint_predictor.parameters()},
-		]
-		self.optim = Adam(parameters, lr=training_config['lr'])
+
+class ScoreModel(nn.Module):
+	def __init__(self, module_config, num_layers=12, num_players=None):
+		super(ScoreModel, self).__init__()
+
+		# Do some special init
+		self.base_model = MixedLinearModel(module_config, num_layers, num_players)
+		self.setup_vectors(module_config, num_layers)
+
 		self.loss_fn = nn.MSELoss()
-
-		self.scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-			self.optim, factor=training_config['patience_factor'], patience=training_config['patience'],
-			verbose=True
-		)
-		self.buffer = Buffer()
 
 	def setup_vectors(self, base_mask, num_layers):
 		# Do a 1 time computation to set things up
@@ -155,43 +170,13 @@ class NonLinearModel(nn.Module):
 		m_types = torch.masked_select(self.m_types, base_vec).long()
 		modules = torch.masked_select(self.mods, base_vec).long()
 		assert layers.shape == m_types.shape == modules.shape, 'Irregular shape given'
-		return layers, m_types, modules
+		return layers, m_types, modules, base_vec
 
-
-	def forward(self, xs, add_joint=True):
-		input_embeds =  self.layer_id_embed(xs[0]) + self.module_type_embed(xs[1]) + self.module_embed(xs[2])
-		featurized = self.featurizer(input_embeds) # B x S x d
-
-		invidividual_preds = (self.individual_predictor * featurized).sum(axis=-1) # B x S x 1
-		invidividual_preds = invidividual_preds.sum(axis=-1, keepdim=True)
-
-		if add_joint:
-			joint_residuals = self.joint_predictor(featurized.mean(axis=1))
-			return invidividual_preds + joint_residuals
-		return invidividual_preds
+	def forward(self, xs):
+		return self.base_model.forward(xs)
 
 	def get_scores(self, base_mask):
-		self.eval()
-		layers, m_types, modules = self.config_to_model_info(base_mask, use_all=True)
-		layers, m_types, modules = layers.cuda(), m_types.cuda(), modules.cuda()
-		with torch.no_grad():
-			bsz = 2**13
-			predictions = []
-			n_batches = math.ceil(layers.shape[0] / bsz)
-			for b_id in tqdm(range(n_batches)):
-				start_, end_ = int(bsz * b_id), int(bsz * (b_id + 1))
-				this_layers = layers[start_: end_].view(-1, 1)
-				this_mtypes = m_types[start_: end_].view(-1, 1)
-				this_modules = modules[start_: end_].view(-1, 1)
-				# get the predictions
-				this_predictions = self.forward([this_layers.cuda(), this_mtypes.cuda(), this_modules.cuda()], add_joint=False)
-				predictions.append(this_predictions)
-
-		self.train()
-		predictions = torch.concat(predictions)
-		stats = predictions.mean().item(), predictions.std().item(), predictions.max().item(), predictions.min().item()
-		print("Predictions Stats : Mean {:.7f}, Std {:.7f}, Max {:.7f}, Min {:.7f}".format(*stats))
-		return predictions
+		return self.base_model.get_scores()
 
 	def pad_sequence(self, xs):
 		lens = [len(x[0]) for x in xs]
@@ -203,52 +188,90 @@ class NonLinearModel(nn.Module):
 			for k in range(len(xs[0])):
 				new_xs[k][i, :lens[i]] = xs[i][k]
 		return [x.cuda() for x in new_xs]
-
-	def update_with_info(self, run_info):
-		xs, og_ys = run_info
-
-		replay_xs, replay_ys = self.buffer.sample(len(xs))
-		xs.extend(replay_xs)
-		og_ys.extend(replay_ys)
-
-		print(len(replay_xs), len(replay_ys))
-
-		ys = torch.tensor(og_ys).cuda()
+	
+	def run_epoch(self, xs, ys, is_train=True):
+		# generate a permutation
+		perm = np.random.permutation(len(ys))
+		running_loss_avg = 0.0
+		n_batches = math.ceil(len(ys) / training_config['bsz'])
+		if not is_train:
+			self.base_model.eval()
 		max_error, min_error = -1, 1
-		for epoch_ in range(training_config['nepochs']):
-			# generate a permutation
-			perm = np.random.permutation(len(ys))
-			running_loss_avg = 0.0
-			n_batches = math.ceil(len(ys) / training_config['bsz'])
-			for batch_id in range(n_batches):
-				start_, end_ = int(training_config['bsz'] * batch_id), int(training_config['bsz'] * (batch_id + 1))
-				this_xs = [xs[i_] for i_ in perm[start_:end_]]
+		for batch_id in range(n_batches):
+			start_, end_ = int(training_config['bsz'] * batch_id), int(training_config['bsz'] * (batch_id + 1))
+			this_xs = [xs[i_][:-1] for i_ in perm[start_:end_]]
+			xs_masks = torch.stack([xs[i_][-1] for i_ in perm[start_:end_]]).float().cuda()
 
-				# We have to do smart padding here
-				this_xs = self.pad_sequence(this_xs)
-				this_ys = ys[perm[start_:end_]].view(-1, 1)
-				# do the forward pass here
-				preds = self.forward(this_xs)
-				# Do some logging here
-				with torch.no_grad():
-					errors = (preds - this_ys).abs()
-					this_max_error = errors.max().item()
-					this_min_error = errors.min().item()
-				max_error = max(max_error, this_max_error)
-				min_error = min(min_error, this_min_error)
-				
-				loss = self.loss_fn(preds, this_ys)
+			# We have to do smart padding here
+			this_xs = self.pad_sequence(this_xs)
+			this_ys = ys[perm[start_:end_]].view(-1, 1)
+			# do the forward pass here
+			this_xs.append(xs_masks)
+			individ_preds, joint_preds = self.forward(this_xs)
+			preds = individ_preds + joint_preds
+
+			if batch_id == 0:
+				for p_ in zip(
+					individ_preds[:3].squeeze().detach().cpu().numpy().tolist(), joint_preds[:3].squeeze().detach().cpu().numpy().tolist(),
+					preds[:3].squeeze().detach().cpu().numpy().tolist(), this_ys[:3].squeeze().detach().cpu().numpy().tolist()):
+					print("Ind {:.3f} | Joint {:.6f} | Pred {:.3f} | True {:.3f}".format(*p_))
+
+			# Do some logging here
+			with torch.no_grad():
+				errors = (preds - this_ys).abs()
+				this_max_error = errors.max().item()
+				this_min_error = errors.min().item()
+			max_error = max(max_error, this_max_error)
+			min_error = min(min_error, this_min_error)
+
+			loss = self.loss_fn(preds, this_ys)
+			if is_train:
 				loss.backward()
 				self.optim.step()
 				self.optim.zero_grad()
-				running_loss_avg += loss.item()
-			running_loss_avg /= n_batches
-			self.scheduler.step(running_loss_avg)
-			print('Epoch {} | Loss : {:.5f} | Max Error : {:.5f} | Min Error : {:.5f}'.format(epoch_, running_loss_avg, max_error, min_error))
-		self.buffer.add_to_buffer(xs, og_ys)
+			running_loss_avg += loss.item()
+		running_loss_avg /= n_batches
+		if not is_train:
+			self.base_model.train()
+		return running_loss_avg, max_error, min_error
+
+	def update_with_info(self, run_info):
+		# Setup the optimizer
+		self.optim = Adam(self.base_model.parameters(), lr=training_config['lr'])
+
+		xs, ys = run_info
+
+		# Split into train and test
+		perm = np.random.permutation(len(ys))
+		trn_list, tst_list = perm[:int(0.8 * len(perm))], perm[int(0.8 * len(perm)):]
+
+		tr_xs, tr_ys = [xs[i] for i in trn_list], [ys[i] for i in trn_list]
+		tr_ys  = torch.tensor(tr_ys).cuda()
+		
+		ts_xs, ts_ys = [xs[i] for i in tst_list], [ys[i] for i in tst_list]
+		ts_ys  = torch.tensor(ts_ys).cuda()
+
+		best_loss, clone, since_best = 1e10, None, 0
+		for epoch_ in range(training_config['nepochs']):
+			running_loss_avg, max_error, min_error = self.run_epoch(tr_xs, tr_ys)
+			print('Epoch {} [Trn] | Loss : {:.5f} | Max Error : {:.5f} | Min Error : {:.5f}'.format(epoch_, running_loss_avg, max_error, min_error))
+			running_loss_avg, max_error, min_error = self.run_epoch(ts_xs, ts_ys, is_train=False)
+			print('Epoch {} [Tst] | Loss : {:.5f} | Max Error : {:.5f} | Min Error : {:.5f}'.format(epoch_, running_loss_avg, max_error, min_error))
+
+			if running_loss_avg < best_loss:
+				print('New Best Model Achieved')
+				best_loss = running_loss_avg
+				clone = deepcopy(self.base_model)
+				since_best = 0
+
+			since_best += 1
+			if since_best > 3:
+				break
+
+		del self.base_model
+		self.base_model = clone
 
 
-			
 class LogisticReg(nn.Module):
 	def __init__(self, num_players=10):
 		super(LogisticReg, self).__init__()
