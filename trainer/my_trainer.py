@@ -109,6 +109,7 @@ class My_Trainer(Trainer):
 
 		self.lagrangian_optimizer = None
 		self.kshap_info = None
+		self.nscoringfn_runs = 1
 
 		self.start_saving_best = True if self.additional_args.pruning_type is None else False
 
@@ -186,33 +187,41 @@ class My_Trainer(Trainer):
 	def get_mask_perf(self, cur_mask, fitness_strategy=None):
 		fitness_strategy = fitness_strategy if fitness_strategy else self.fitness_strategy
 		if fitness_strategy == 'linear_fit':
-			with torch.no_grad():
-				# Get a batch of data
-				tr_inputs = self.get_next_batch(is_train=True)
-				val_inputs = self.get_next_batch(is_train=False)
-				tr_outputs = self.run_through_model(cur_mask, tr_inputs)
-				val_outputs = self.run_through_model(cur_mask, val_inputs)
-			return self.linear_fit_and_evaluate(tr_outputs, val_outputs)
+			results = []
+			val_inputs = self.get_next_batch(is_train=False)
+			val_outputs = self.run_through_model(cur_mask, val_inputs)
+			for _ in range(self.nscoringfn_runs):
+				with torch.no_grad():
+					# Get a batch of data
+					tr_inputs = self.get_next_batch(is_train=True)
+					tr_outputs = self.run_through_model(cur_mask, tr_inputs)
+				results.append(self.linear_fit_and_evaluate(tr_outputs, val_outputs))
+			return np.mean(results)
 		elif fitness_strategy == 'embedding_cosine':
 			assert self.teacher_model is not None, 'To use this strategy the teacher must be available'
-			with torch.no_grad():
-				tr_inputs = self.get_next_batch(is_train=True)
-				original_embeds = self.teacher_model(** self._prepare_inputs(tr_inputs))['pooler_output']
-				masked_embeds = self.run_through_model(cur_mask, tr_inputs)[0]
-				cos_scores = nn.CosineSimilarity(dim=-1, eps=1e-6)(masked_embeds, original_embeds) + 1.0
-			return cos_scores.mean().item()
+			results = []
+			for _ in range(self.nscoringfn_runs):
+				with torch.no_grad():
+					tr_inputs = self.get_next_batch(is_train=True)
+					original_embeds = self.teacher_model(** self._prepare_inputs(tr_inputs))['pooler_output']
+					masked_embeds = self.run_through_model(cur_mask, tr_inputs)[0]
+					cos_scores = nn.CosineSimilarity(dim=-1, eps=1e-6)(masked_embeds, original_embeds) + 1.0
+				results.append(cos_scores.mean().item())
+			return np.mean(results)
 		elif fitness_strategy == 'transRate':
-			with torch.no_grad():
-				# Get a batch of data
-				tr_inputs = self.get_next_batch(is_train=True)
-				val_inputs = self.get_next_batch(is_train=False)
+			results = []
+			val_inputs = self.get_next_batch(is_train=False)
+			val_outputs = self.run_through_model(cur_mask, val_inputs)
+			for _ in range(self.nscoringfn_runs):
+				with torch.no_grad():
+					# Get a batch of data
+					tr_inputs = self.get_next_batch(is_train=True)
+					tr_outputs = self.run_through_model(cur_mask, tr_inputs)
 
-				tr_outputs = self.run_through_model(cur_mask, tr_inputs)
-				val_outputs = self.run_through_model(cur_mask, val_inputs)
-
-				Z, y = torch.concat([tr_outputs[0], val_outputs[0]]), torch.concat([tr_outputs[1], val_outputs[1]])
-				transrate = transRate(Z, y)
-				return transrate
+					Z, y = torch.concat([tr_outputs[0], val_outputs[0]]), torch.concat([tr_outputs[1], val_outputs[1]])
+					transrate = transRate(Z, y)
+					results.append(transrate)
+			return np.mean(results)
 		else: 
 			raise ValueError('Incorrect fitness strategy specified : ', fitness_strategy)
 
@@ -243,6 +252,8 @@ class My_Trainer(Trainer):
 
 			shapley_bool = (self.base_zs[k].view(-1)  > 0) * (this_shap > threshold)
 			self.base_zs[k] = (shapley_bool * 1.0 / 2.0).view(orig_shape)
+			if k == 'intermediate_z':
+				self.base_zs[k] = (self.base_zs['mlp_z'] > 0).view(-1, 1, 1, 1) * self.base_zs[k]
 			occupancies[k] = (self.base_zs[k] * 2.0).mean().item() # Because we have 0.5 as the bernoulli probability
 			pointer += numel_
 		return occupancies
@@ -266,7 +277,8 @@ class My_Trainer(Trainer):
 			numel_ = self.base_zs[k].numel()
 			orig_shape = self.base_zs[k].shape
 			self.base_zs[k] = (torch.FloatTensor(shapley_bool[pointer : pointer + numel_]) / 2.0).view(orig_shape)
-
+			if k == 'intermediate_z':
+				self.base_zs[k] = (self.base_zs['mlp_z'] > 0).view(-1, 1, 1, 1) * self.base_zs[k]
 			occupancies[k] = (self.base_zs[k] * 2.0).mean().item() # Because we have 0.5 as the bernoulli probability
 			pointer += numel_
 		return occupancies
@@ -295,7 +307,7 @@ class My_Trainer(Trainer):
 			this_vec.append(result)
 		return torch.concat(this_vec)
 
-	def construct_module_scores(self, paired=False):
+	def construct_module_scores(self, paired=True):
 		best_perf_so_far, best_random_mask = -1.0, None
 
 		num_iters = int(self.masks_per_round / 2) if paired else self.masks_per_round
@@ -417,6 +429,7 @@ class My_Trainer(Trainer):
 				predictions = linear_model(test_x).argmax(axis=-1)
 				eval_accuracy = (predictions.eq(test_y) * 1.0).mean().item()
 				max_eval_acc = max(max_eval_acc, eval_accuracy)
+# 				print(j_, eval_accuracy,  max_eval_acc)
 				linear_model.train()
 # 			print(j_, loss_.item(), eval_accuracy, max_eval_acc)
 # 		print(max_eval_acc)

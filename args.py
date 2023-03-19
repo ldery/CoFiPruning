@@ -49,7 +49,7 @@ class AdditionalArguments():
 	reset_LN: bool = field(default=False, metadata={"help": "Whether to reset the layer norm parameters during finetuning"})
 	get_random_architecture: bool = field(default=False, metadata={"help": "Whether we want to get a random architecture"})
 	random_init: bool = field(default=False, metadata={"help": "Whether we want to use a random initialization for the pruned model"})
-
+	
 	do_layer_distill: bool = field(default=False, metadata={"help": "Align layer output through distillation"})
 	layer_distill_version: int = field(default=1, metadata={"help": "1: add loss to each layer, 2: add loss to existing layers only"})
 	distill_loss_alpha: float = field(default=0.9, metadata={"help": "Distillation loss weight"})

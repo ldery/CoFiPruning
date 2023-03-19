@@ -14,9 +14,9 @@ from torch.nn.init import kaiming_normal_
 
 
 training_config = {
-	'lr' : 5e-5,
+	'lr' : 1e-4,
 	'bsz' : 16,
-	'nepochs' : 10,
+	'nepochs' : 10, #5
 	'l1_weight': 0,
 # 	'd_in': 10,
 # 	'd_rep': 100,
@@ -91,7 +91,7 @@ class MixedLinearModel(nn.Module):
 		self.module_embed = nn.Embedding(num_modules + 1, input_embed_dim, padding_idx=0) # + 1 for the padding
 
 		self.score_tensor = nn.parameter.Parameter(create_tensor((num_players, 1)))
-
+		self.num_players = num_players
 		# Member featurizer
 		hidden_sz = training_config['d_rep']
 		self.featurizer = nn.Sequential(
@@ -105,6 +105,10 @@ class MixedLinearModel(nn.Module):
 			nn.Linear(hidden_sz, 1),
 		)
 		self.joint_predictor.apply(weight_init_fn(0.5))
+	
+	def reset_linear(self):
+		del self.score_tensor
+		self.score_tensor = nn.parameter.Parameter(create_tensor((self.num_players, 1)))
 
 	def forward(self, xs):
 		individual_preds = torch.matmul(xs[-1], self.score_tensor)
@@ -113,6 +117,8 @@ class MixedLinearModel(nn.Module):
 		pad_mask = (xs[0] > 0).unsqueeze(-1).float()
 		features = (features * pad_mask).sum(axis=1) / pad_mask.sum(axis=1)
 		joint_preds = self.joint_predictor(features)
+# 		# TODO [ldery] -- remove this
+# 		joint_preds = torch.zeros_like(joint_preds)
 		return individual_preds , joint_preds
 	
 	def get_scores(self):
@@ -237,6 +243,8 @@ class ScoreModel(nn.Module):
 
 	def update_with_info(self, run_info):
 		# Setup the optimizer
+		# reset base model.
+# 		self.base_model.reset_linear()
 		self.optim = Adam(self.base_model.parameters(), lr=training_config['lr'])
 
 		xs, ys = run_info
@@ -246,21 +254,22 @@ class ScoreModel(nn.Module):
 		trn_list, tst_list = perm[:int(0.8 * len(perm))], perm[int(0.8 * len(perm)):]
 
 		tr_xs, tr_ys = [xs[i] for i in trn_list], [ys[i] for i in trn_list]
-		tr_ys  = torch.tensor(tr_ys).cuda()
+		tr_ys  = torch.tensor(tr_ys).float().cuda()
 		
 		ts_xs, ts_ys = [xs[i] for i in tst_list], [ys[i] for i in tst_list]
-		ts_ys  = torch.tensor(ts_ys).cuda()
+		ts_ys  = torch.tensor(ts_ys).float().cuda()
 
 		best_loss, clone, since_best = 1e10, None, 0
 		for epoch_ in range(training_config['nepochs']):
-			running_loss_avg, max_error, min_error = self.run_epoch(tr_xs, tr_ys)
-			print('Epoch {} [Trn] | Loss : {:.5f} | Max Error : {:.5f} | Min Error : {:.5f}'.format(epoch_, running_loss_avg, max_error, min_error))
-			running_loss_avg, max_error, min_error = self.run_epoch(ts_xs, ts_ys, is_train=False)
-			print('Epoch {} [Tst] | Loss : {:.5f} | Max Error : {:.5f} | Min Error : {:.5f}'.format(epoch_, running_loss_avg, max_error, min_error))
+			print('Epoch - ', epoch_)
+			run_out = self.run_epoch(tr_xs, tr_ys)
+			print('Epoch {} [Trn] | Loss : {:.5f} | Max Error : {:.5f} | Min Error : {:.5f}'.format(epoch_, *run_out))
+			run_out = self.run_epoch(ts_xs, ts_ys, is_train=False)
+			print('Epoch {} [Tst] | Loss : {:.5f} | Max Error : {:.5f} | Min Error : {:.5f}'.format(epoch_, *run_out))
 
-			if running_loss_avg < best_loss:
+			if run_out[0] < best_loss:
 				print('New Best Model Achieved')
-				best_loss = running_loss_avg
+				best_loss = run_out[0]
 				clone = deepcopy(self.base_model)
 				since_best = 0
 
