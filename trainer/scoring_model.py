@@ -17,7 +17,7 @@ training_config = {
 	'lr' : 1e-4,
 	'bsz' : 16,
 	'nepochs' : 10, #5
-	'l1_weight': 0,
+	'l1_weight': 1e3, #1e-2,
 # 	'd_in': 10,
 # 	'd_rep': 100,
 	'd_in': 3,
@@ -109,6 +109,9 @@ class MixedLinearModel(nn.Module):
 	def reset_linear(self):
 		del self.score_tensor
 		self.score_tensor = nn.parameter.Parameter(create_tensor((self.num_players, 1)))
+		
+	def l1Loss(self):
+		return nn.L1Loss()(self.score_tensor, torch.zeros_like(self.score_tensor))
 
 	def forward(self, xs):
 		individual_preds = torch.matmul(xs[-1], self.score_tensor)
@@ -216,11 +219,14 @@ class ScoreModel(nn.Module):
 			individ_preds, joint_preds = self.forward(this_xs)
 			preds = individ_preds + joint_preds
 
+			loss = self.loss_fn(preds, this_ys)
+			l1loss = self.base_model.l1Loss()
+
 			if batch_id == 0:
 				for p_ in zip(
-					individ_preds[:3].squeeze().detach().cpu().numpy().tolist(), joint_preds[:3].squeeze().detach().cpu().numpy().tolist(),
 					preds[:3].squeeze().detach().cpu().numpy().tolist(), this_ys[:3].squeeze().detach().cpu().numpy().tolist()):
-					print("Ind {:.3f} | Joint {:.6f} | Pred {:.3f} | True {:.3f}".format(*p_))
+					print("Pred {:.3f} | GT {:.3f}".format(*p_))
+				print("Loss {:.3f} | L1 {:.5f}".format(loss, l1loss))
 
 			# Do some logging here
 			with torch.no_grad():
@@ -230,8 +236,8 @@ class ScoreModel(nn.Module):
 			max_error = max(max_error, this_max_error)
 			min_error = min(min_error, this_min_error)
 
-			loss = self.loss_fn(preds, this_ys)
 			if is_train:
+				loss = loss + (training_config['l1_weight'] * l1loss)
 				loss.backward()
 				self.optim.step()
 				self.optim.zero_grad()
