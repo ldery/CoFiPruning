@@ -118,7 +118,7 @@ class MixedLinearModel(nn.Module):
 		features = (features * pad_mask).sum(axis=1) / pad_mask.sum(axis=1)
 		joint_preds = self.joint_predictor(features)
 # 		# TODO [ldery] -- remove this
-# 		joint_preds = torch.zeros_like(joint_preds)
+		joint_preds = torch.zeros_like(joint_preds)
 		return individual_preds , joint_preds
 	
 	def get_scores(self):
