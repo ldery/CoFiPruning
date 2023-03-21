@@ -188,8 +188,9 @@ class My_Trainer(Trainer):
 		fitness_strategy = fitness_strategy if fitness_strategy else self.fitness_strategy
 		if fitness_strategy == 'linear_fit':
 			results = []
-			val_inputs = self.get_next_batch(is_train=False)
-			val_outputs = self.run_through_model(cur_mask, val_inputs)
+			with torch.no_grad():
+				val_inputs = self.get_next_batch(is_train=False)
+				val_outputs = self.run_through_model(cur_mask, val_inputs)
 			for _ in range(self.nscoringfn_runs):
 				with torch.no_grad():
 					# Get a batch of data
@@ -210,8 +211,9 @@ class My_Trainer(Trainer):
 			return np.mean(results)
 		elif fitness_strategy == 'transRate':
 			results = []
-			val_inputs = self.get_next_batch(is_train=False)
-			val_outputs = self.run_through_model(cur_mask, val_inputs)
+			with torch.no_grad():
+				val_inputs = self.get_next_batch(is_train=False)
+				val_outputs = self.run_through_model(cur_mask, val_inputs)
 			for _ in range(self.nscoringfn_runs):
 				with torch.no_grad():
 					# Get a batch of data
@@ -313,6 +315,7 @@ class My_Trainer(Trainer):
 		num_iters = int(self.masks_per_round / 2) if paired else self.masks_per_round
 
 		bool_vecs, scores = [], []
+
 		for idx_ in tqdm(range(num_iters)):
 			pair = self.gen_random_mask(paired=paired)
 			for p_id, cur_mask in enumerate(pair):
