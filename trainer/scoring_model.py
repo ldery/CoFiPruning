@@ -17,7 +17,7 @@ training_config = {
 	'lr' : 1e-4,
 	'bsz' : 16,
 	'nepochs' : 10, #5
-	'l1_weight': 1, #1e-2,
+	'l1_weight': 100, #1e-2,
 # 	'd_in': 10,
 # 	'd_rep': 100,
 	'd_in': 3,
