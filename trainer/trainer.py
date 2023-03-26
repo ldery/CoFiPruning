@@ -579,7 +579,7 @@ class CoFiTrainer(Trainer):
 					test_pred_label = [label_list[tr] for tr in preds]
 
 				test_pred = pd.DataFrame({'index': range(len(test_pred_label)), 'prediction': test_pred_label})
-				save_path = os.path.join(best_dir, 'test_predictions.tsv')
+				save_path = os.path.join(best_dir, '{}.tsv'.format(self.model.config.finetuning_task.upper()))
 				test_pred.to_csv(save_path, sep='\t', index=False)
 
 
