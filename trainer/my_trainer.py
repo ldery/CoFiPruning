@@ -258,6 +258,12 @@ class My_Trainer(Trainer):
 				self.base_zs[k] = (self.base_zs['mlp_z'] > 0).view(-1, 1, 1, 1) * self.base_zs[k]
 			occupancies[k] = (self.base_zs[k] * 2.0).mean().item() # Because we have 0.5 as the bernoulli probability
 			pointer += numel_
+
+		base_zs_clone = {}
+		for k in self.arch_comp_keys:
+			base_zs_clone[k] = self.base_zs[k]
+		self.scoring_model.set_base_mask(base_zs_clone)
+
 		return occupancies
 
 	def reset_base_zs_global(self):
@@ -283,6 +289,11 @@ class My_Trainer(Trainer):
 				self.base_zs[k] = (self.base_zs['mlp_z'] > 0).view(-1, 1, 1, 1) * self.base_zs[k]
 			occupancies[k] = (self.base_zs[k] * 2.0).mean().item() # Because we have 0.5 as the bernoulli probability
 			pointer += numel_
+
+		base_zs_clone = {}
+		for k in self.arch_comp_keys:
+			base_zs_clone[k] = self.base_zs[k]
+		self.scoring_model.set_base_mask(base_zs_clone)
 		return occupancies
 
 	def check_and_retrieve_past_runs(self):

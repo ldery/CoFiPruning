@@ -15,17 +15,19 @@ from torch.nn.init import kaiming_normal_
 
 training_config = {
 	'lr' : 1e-4,
+	'var_lr': 1e2, #1.0,
 	'bsz' : 16,
-	'nepochs' : 10, #5
-	'l1_weight': 100, #1e-2,
-# 	'd_in': 10,
-# 	'd_rep': 100,
+	'nepochs' : 20, #5
+	'reg_weight': 1.0,
+	'reg_reg_weight': 1e-2,
 	'd_in': 3,
 	'd_rep': 10,
 	'dp_prob': 0.1,
 	'patience': 5,
 	'patience_factor': 0.5
 }
+
+EPS = 1e-10
 
 class Buffer(object):
 	def __init__(self, max_size=500):
@@ -74,24 +76,43 @@ class LinearModel(nn.Module):
 	def __init__(self, num_players):
 		super(LinearModel, self).__init__()
 		self.score_tensor = nn.parameter.Parameter(create_tensor((num_players, 1)))
+		self.variances = nn.parameter.Parameter(create_tensor((num_players, 1))) 
 		self.num_players = num_players
+		self.base_mask = None
 
 	def reset_linear(self):
 		del self.score_tensor
 		self.score_tensor = nn.parameter.Parameter(create_tensor((self.num_players, 1)))
+		self.variances = nn.parameter.Parameter(create_tensor((self.num_players, 1)))
 
-	def l1Loss(self):
-		return nn.L1Loss()(self.score_tensor, torch.zeros_like(self.score_tensor))
+	def regLoss(self):
+		# This is the loss that takes the variances into account.
+		chosen_vars = self.variances if self.base_mask is None else self.variances[self.base_mask > 0]
+		chosen_scores = self.score_tensor if self.base_mask is None else self.score_tensor[self.base_mask > 0]
+		v_and_w = ((chosen_scores**2) / (torch.exp(chosen_vars) + EPS)).sum()
+		v_only = chosen_vars.sum()
+		return v_only, v_and_w
 
 	def forward(self, xs):
 		return torch.matmul(xs, self.score_tensor)
 	
-	def get_scores(self):
+	def get_scores(self, base_mask):
 		with torch.no_grad():
 			predictions = self.score_tensor.detach()
-		stats = predictions.mean().item(), predictions.std().item(), predictions.max().item(), predictions.min().item()
-		print("Predictions Stats : Mean {:.7f}, Std {:.7f}, Max {:.7f}, Min {:.7f}".format(*stats))
+			stds = self.variances.detach().exp().sqrt()
+
+			active_preds = predictions[base_mask > 0]
+			active_stds = stds[base_mask > 0]
+
+		stats = active_preds.mean().item(), active_preds.std().item(), active_preds.max().item(), active_preds.min().item()
+		print("Predictions vals : Mean {:.7f}, Std {:.7f}, Max {:.7f}, Min {:.7f}".format(*stats))
+
+		stats = active_stds.mean().item(), active_stds.std().item(), active_stds.max().item(), active_stds.min().item()
+		print("Predictions Stds : Mean {:.7f}, Std {:.7f}, Max {:.7f}, Min {:.7f}".format(*stats))
 		return predictions
+
+	def set_base_mask(self, base_mask):
+		self.base_mask = base_mask
 
 
 class ScoreModel(nn.Module):
@@ -113,9 +134,12 @@ class ScoreModel(nn.Module):
 
 	def forward(self, xs):
 		return self.base_model.forward(xs)
+	
+	def set_base_mask(self, base_mask):
+		self.base_model.set_base_mask(self.config_to_model_info(base_mask))
 
 	def get_scores(self, base_mask):
-		return self.base_model.get_scores()
+		return self.base_model.get_scores(self.config_to_model_info(base_mask))
 	
 	def run_epoch(self, xs, ys, is_train=True):
 		# generate a permutation
@@ -134,27 +158,38 @@ class ScoreModel(nn.Module):
 			preds = self.forward(xs_masks)
 
 			loss = self.loss_fn(preds, this_ys)
-			l1loss = self.base_model.l1Loss()
+			regLoss = self.base_model.regLoss()
 
 			if batch_id == 0:
 				for p_ in zip(
 					preds[:3].squeeze().detach().cpu().numpy().tolist(), this_ys[:3].squeeze().detach().cpu().numpy().tolist()):
 					print("Pred {:.3f} | GT {:.3f}".format(*p_))
-				print("Loss {:.3f} | L1 {:.5f}".format(loss, l1loss))
+				print("Loss {:.3f} | Reg V {:.6f} | Reg W/V {:.5f}".format(loss, *regLoss))
 
 			# Do some logging here
 			with torch.no_grad():
 				errors = (preds - this_ys).abs()
 				this_max_error = errors.max().item()
 				this_min_error = errors.min().item()
+
 			max_error = max(max_error, this_max_error)
 			min_error = min(min_error, this_min_error)
 
 			if is_train:
-				loss = loss + (training_config['l1_weight'] * l1loss)
+				# Clamp the losses to be within bounds of the training data likelihood.
+				regLoss = torch.clamp(regLoss[0], -1.0, 1.0), torch.clamp(regLoss[1], -1.0, 1.0)
+				loss = loss + (training_config['reg_weight'] * regLoss[1] + training_config['reg_reg_weight'] * regLoss[0])
 				loss.backward()
-				self.optim.step()
-				self.optim.zero_grad()
+# 				print(self.base_model.variances.grad.min().item(), self.base_model.variances.grad.mean().item(), self.base_model.variances.grad.max().item() )
+# 				nn.utils.clip_grad_norm_(self.base_model.parameters(), training_config['gradient_clip'])
+# 				print('After : ', self.base_model.variances.grad.mean().item(), self.base_model.variances.grad.max().item() )
+
+				self.score_optim.step()
+				self.score_optim.zero_grad()
+				
+				self.var_optim.step()
+				self.var_optim.zero_grad()
+				
 			running_loss_avg += loss.item()
 		running_loss_avg /= n_batches
 		if not is_train:
@@ -163,7 +198,9 @@ class ScoreModel(nn.Module):
 
 	def update_with_info(self, run_info):
 		# Setup the optimizer
-		self.optim = Adam(self.base_model.parameters(), lr=training_config['lr'])
+
+		self.score_optim = Adam([self.base_model.score_tensor], lr=training_config['lr'])
+		self.var_optim = SGD([self.base_model.variances], lr=training_config['var_lr'])
 
 		xs, ys = run_info
 
@@ -179,11 +216,16 @@ class ScoreModel(nn.Module):
 
 		best_loss, clone, since_best = 1e10, None, 0
 		for epoch_ in range(training_config['nepochs']):
+
 			print('Epoch - ', epoch_)
 			run_out = self.run_epoch(tr_xs, tr_ys)
 			print('Epoch {} [Trn] | Loss : {:.5f} | Max Error : {:.5f} | Min Error : {:.5f}'.format(epoch_, *run_out))
 			run_out = self.run_epoch(ts_xs, ts_ys, is_train=False)
 			print('Epoch {} [Tst] | Loss : {:.5f} | Max Error : {:.5f} | Min Error : {:.5f}'.format(epoch_, *run_out))
+
+# 			active_stds = self.base_model.variances.detach().exp().sqrt()
+# 			stats = active_stds.mean().item(), active_stds.std().item(), active_stds.max().item(), active_stds.min().item()
+# 			print("Predictions Stds : Mean {:.7f}, Std {:.7f}, Max {:.7f}, Min {:.7f}".format(*stats))
 
 			if run_out[0] < best_loss:
 				print('New Best Model Achieved')

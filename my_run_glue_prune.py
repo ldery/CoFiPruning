@@ -4,6 +4,7 @@ import sys
 import time
 import random
 from copy import deepcopy
+import shutil
 
 import datasets
 import numpy as np
@@ -371,6 +372,17 @@ def main():
 
 	# Need to do the fancy pertubative stuff here
 	training_args.per_device_eval_batch_size = 1024 # TODO [ldery] - hardcoded - need to fix
+
+	# Snapshot the current code base.
+	files_to_snapshot = ['trainer/my_trainer.py', 'trainer/scoring_model.py']
+	save_dir = os.path.join(training_args.output_dir, 'trainer')
+	if not os.path.exists(save_dir):
+		os.makedirs(save_dir)
+	for file in files_to_snapshot:
+		this_file = os.path.join(os.getcwd(), file)
+		# copy file to this new destination.
+		shutil.copyfile(this_file, os.path.join(training_args.output_dir, file))
+
 	trainer = My_Trainer(
 		model=model,
 		args=training_args,
