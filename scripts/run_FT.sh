@@ -62,6 +62,7 @@ python3 $code_dir/run_glue_prune.py \
 	   --ex_name ${ex_name} \
 	   --do_train \
 	   --do_eval \
+	   --do_predict \
 	   --pretrained_pruned_model ${pretrained_pruned_model} \
 	   --max_seq_length ${max_seq_length} \
 	   --per_device_train_batch_size ${batch_size} \
