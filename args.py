@@ -28,6 +28,7 @@ class AdditionalArguments():
     reg_learning_rate: float = field(default=0.1, metadata={"help": "Learning rate for regularization."})
     scheduler_type: str = field(default="linear", metadata={"help": "type of scheduler"})
     freeze_embeddings: bool = field(default=False, metadata={"help": "Whether we should freeze the embeddings."})
+    fit_linear_head: bool = field(default=False, metadata={"help": "Whether to fit a linear head to the pre-trained model"})
 
     pretrained_pruned_model: str = field(default=None, metadata={"help": "Path of pretrained model."})
 

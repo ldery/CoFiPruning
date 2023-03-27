@@ -191,6 +191,44 @@ class CoFiTrainer(Trainer):
 				)
 			else:
 				self.lr_scheduler = None
+	
+	
+	def fit_linear_head(self, epoch_iterator):
+		optimizer = AdamW(
+				self.teacher_model.classifier.parameters(),
+				lr=5e-4,
+				betas=(self.args.adam_beta1, self.args.adam_beta2),
+				eps=self.args.adam_epsilon,
+			)
+		for epoch_ in range(2):
+			total = 0.0
+			for step, inputs in enumerate(epoch_iterator):
+				inputs = self._prepare_inputs(inputs)
+				tr_loss_step = self.compute_loss(self.teacher_model, inputs)
+				tr_loss_step.backward()
+
+				if (step + 1) % self.args.gradient_accumulation_steps == 0 or (
+						len(epoch_iterator) <= self.args.gradient_accumulation_steps
+						and (step + 1) == len(epoch_iterator)
+				):
+					torch.nn.utils.clip_grad_norm_(
+						self.teacher_model.classifier.parameters(), self.args.max_grad_norm)
+
+					optimizer.step()
+					self.teacher_model.zero_grad()
+				total += tr_loss_step
+			total /= step
+			# Evaluate on the dev-set
+			self.teacher_model.eval()
+			eval_dataloader = self.get_eval_dataloader()
+			eval_loss = 0
+			for step, inputs in enumerate(eval_dataloader):
+				inputs = self._prepare_inputs(inputs)
+				loss = self.compute_loss(self.teacher_model, inputs)
+				eval_loss += loss
+			eval_loss /= step
+			logger.info('Epoch {} | Train loss : {} | Eval loss : {}'.format(epoch_, total, eval_loss))
+			self.teacher_model.train()
 
 	def train(self):
 		train_dataloader = self.get_train_dataloader()
@@ -268,6 +306,11 @@ class CoFiTrainer(Trainer):
 
 		self.evaluate()
 
+		# By [ldery]
+		# Fit a linear head to the teacher model.
+		if self.additional_args.fit_linear_head:
+			self.fit_linear_head(train_dataloader)
+
 		# training
 		for epoch in range(epochs_trained, int(np.ceil(num_train_epochs))): #! 20 epoch
 			epoch_start = time.time()
@@ -309,11 +352,12 @@ class CoFiTrainer(Trainer):
 				lag_loss += lag_loss_step if lag_loss_step is not None else 0.0
 
 				self.total_flos += self.floating_point_ops(inputs)
-
+				
 				if (step + 1) % self.args.gradient_accumulation_steps == 0 or (
 						len(epoch_iterator) <= self.args.gradient_accumulation_steps
 						and (step + 1) == len(epoch_iterator)
 				):
+
 					torch.nn.utils.clip_grad_norm_(
 						model.parameters(), self.args.max_grad_norm)
 
@@ -379,6 +423,7 @@ class CoFiTrainer(Trainer):
 					break
 
 			epoch_end = time.time()
+
 			# wandb.log({'epoch':epoch})
 			logger.info(
 				f"Epoch {epoch} finished. Took {round(epoch_end - epoch_start, 2)} seconds.")
@@ -561,26 +606,28 @@ class CoFiTrainer(Trainer):
 				self.model.save_pretrained(best_dir)
 
 				# We also want to generate the test set predictions here if that is the case !
-				logger.info(f"Generating Test Set Predictions")
-				test_dataloader = self.get_test_dataloader(self.test_dataset)
-				test_output = self.prediction_loop(test_dataloader, description="Test")
+				if self.test_dataset is not None:
+					logger.info(f"Generating Test Set Predictions")
+					test_dataloader = self.get_test_dataloader(self.test_dataset)
+					assert test_dataloader is not None, 'The test dataset loader is none for some reason'
+					test_output = self.prediction_loop(test_dataloader, description="Test")
 
-				preds = test_output.predictions
-				if glue_output_modes[self.model.config.finetuning_task] == "classification":
-					preds = np.argmax(preds, axis=1)
-				elif glue_output_modes[self.model.config.finetuning_task] == "regression":
-					preds = np.squeeze(preds)
+					preds = test_output.predictions
+					if glue_output_modes[self.model.config.finetuning_task] == "classification":
+						preds = np.argmax(preds, axis=1)
+					elif glue_output_modes[self.model.config.finetuning_task] == "regression":
+						preds = np.squeeze(preds)
 
-				if self.model.config.finetuning_task == 'sts-b':
-					test_pred_label = [tr for tr in preds]
-				else:
-					# Get the label list for the task
-					label_list = self.test_dataset.features["label"].names
-					test_pred_label = [label_list[tr] for tr in preds]
+					if self.model.config.finetuning_task == 'sts-b':
+						test_pred_label = [tr for tr in preds]
+					else:
+						# Get the label list for the task
+						label_list = self.test_dataset.features["label"].names
+						test_pred_label = [label_list[tr] for tr in preds]
 
-				test_pred = pd.DataFrame({'index': range(len(test_pred_label)), 'prediction': test_pred_label})
-				save_path = os.path.join(best_dir, '{}.tsv'.format(self.model.config.finetuning_task.upper()))
-				test_pred.to_csv(save_path, sep='\t', index=False)
+					test_pred = pd.DataFrame({'index': range(len(test_pred_label)), 'prediction': test_pred_label})
+					save_path = os.path.join(best_dir, '{}.tsv'.format(self.model.config.finetuning_task.upper()))
+					test_pred.to_csv(save_path, sep='\t', index=False)
 
 
 		return output.metrics
@@ -749,16 +796,18 @@ class CoFiTrainer(Trainer):
 			loss = loss / self.args.gradient_accumulation_steps
 
 		loss.backward()
+		result_dict = {
+						"loss": loss.detach(),
+						"lagrangian_loss": lagrangian_loss.detach() if lagrangian_loss is not None else None,
+						"distill_layer_loss": distill_loss.detach() if distill_loss is not None else None,
+						"distill_ce_loss": distill_ce_loss.detach() if distill_ce_loss is not None else None
+				}
 
 		# wandb.log({"loss": loss.detach(),
 		#         "lagrangian_loss": lagrangian_loss.detach() if lagrangian_loss is not None else None,
 		#         "distill_layer_loss": distill_loss.detach() if distill_loss is not None else None,
 		#         "distill_ce_loss": distill_ce_loss.detach() if distill_ce_loss is not None else None})
-
-		return {"loss": loss.detach(),
-				"lagrangian_loss": lagrangian_loss.detach() if lagrangian_loss is not None else None,
-				"distill_layer_loss": distill_loss.detach() if distill_loss is not None else None,
-				"distill_ce_loss": distill_ce_loss.detach() if distill_ce_loss is not None else None}
+		return result_dict
 
 	def fill_inputs_with_zs(self, zs, inputs):
 		for key in zs:

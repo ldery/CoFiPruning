@@ -57,11 +57,11 @@ scheduler_type=linear
 
 # if [[ " ${glue_low[*]} " =~ ${task_name} ]]; then
 #     echo 'In the low-glue area'
-#     eval_steps=50
-#     epochs=50
-#     start_saving_best_epochs=25
-#     prepruning_finetune_epochs=2
-#     lagrangian_warmup_epochs=10
+#     eval_steps=25
+#     epochs=15
+#     start_saving_best_epochs=3
+#     prepruning_finetune_epochs=1
+#     lagrangian_warmup_epochs=3
 # fi
 
 if [[ " ${glue_low[*]} " =~ ${task_name} ]]; then
@@ -113,6 +113,7 @@ python3 $code_dir/run_glue_prune.py \
 	   --seed ${seed} \
 	   --pruning_type ${pruning_type} \
      --pretrained_pruned_model ${pretrained_pruned_model} \
+     --fit_linear_head \
      --target_sparsity $target_sparsity \
      --freeze_embeddings \
      --do_distill \
