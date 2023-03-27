@@ -4,14 +4,14 @@ proj_dir=CoFI_runs
 LEARNING_RATE=$3
 TEACHER_PATH=$4
 EX_CATE=$5
-PRUNED_MODEL_PATH=$proj_dir/$TASK/$EX_CATE/${TASK}_${SUFFIX}/best
+SEED=$6
+PRUNED_MODEL_PATH=$proj_dir/$TASK/$EX_CATE/${TASK}_${SUFFIX}/$SEED/best
 
+if [ ! -d $PRUNED_MODEL_PATH ] 
+then
+    PRUNED_MODEL_PATH=$proj_dir/$TASK/$EX_CATE/${TASK}_${SUFFIX}/${SEED}
+    echo $PRUNED_MODEL_PATH ' has been updated'
+fi
 
-
-echo $SUFFIX
-echo $PRUNED_MODEL_PATH
-echo $PRUNING_TYPE
-echo $LEARNING_RATE
-echo $TEACHER_PATH
 
 bash scripts/run_FT.sh $TASK $SUFFIX $LEARNING_RATE $PRUNED_MODEL_PATH $TEACHER_PATH

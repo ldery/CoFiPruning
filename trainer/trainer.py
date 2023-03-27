@@ -216,19 +216,22 @@ class CoFiTrainer(Trainer):
 
 					optimizer.step()
 					self.teacher_model.zero_grad()
-				total += tr_loss_step
+				total += tr_loss_step.item()
+
 			total /= step
 			# Evaluate on the dev-set
 			self.teacher_model.eval()
 			eval_dataloader = self.get_eval_dataloader()
 			eval_loss = 0
-			for step, inputs in enumerate(eval_dataloader):
-				inputs = self._prepare_inputs(inputs)
-				loss = self.compute_loss(self.teacher_model, inputs)
-				eval_loss += loss
+			with torch.no_grad():
+				for step, inputs in enumerate(eval_dataloader):
+					inputs = self._prepare_inputs(inputs)
+					loss = self.compute_loss(self.teacher_model, inputs)
+					eval_loss += loss.item()
 			eval_loss /= step
 			logger.info('Epoch {} | Train loss : {} | Eval loss : {}'.format(epoch_, total, eval_loss))
 			self.teacher_model.train()
+
 
 	def train(self):
 		train_dataloader = self.get_train_dataloader()

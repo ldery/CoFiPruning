@@ -35,13 +35,13 @@ reg_learning_rate=0.01
 epochs=20 
 
 # seed
-seed=57
+seed=${12}
 
 # output dir
 ex_name_suffix=$2
 ex_name=${task_name}_${ex_name_suffix}
 ex_cate=$3
-output_dir=${proj_dir}/CoFI_runs/${task_name}/${ex_cate}/${ex_name}
+output_dir=${proj_dir}/CoFI_runs/${task_name}/${ex_cate}/${ex_name}/$seed
 
 # pruning and distillation
 pruning_type=$4
