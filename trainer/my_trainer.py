@@ -152,11 +152,17 @@ class My_Trainer(Trainer):
 		self.scoring_model.cuda()
 
 	def gen_random_mask(self, paired=False):
+		candidate = self.scoring_model.get_candidate()
 		mask = {}
 		anti_mask = {} if paired else None
+		pos_ = 0
 		for k, v in self.base_zs.items():
 			if k in self.arch_comp_keys:
-				mask[k] = torch.bernoulli(v)
+				if candidate is not None:
+					mask[k] = (candidate[pos_:(pos_ + v.numel())]).view(v.shape)
+					pos_ += v.numel()
+				else:
+					mask[k] = torch.bernoulli(v)
 				if anti_mask is not None:
 					anti_mask[k] = (1.0 - mask[k]) * (v > 0.0) # only generate anti-mask for active nodes
 			else:
