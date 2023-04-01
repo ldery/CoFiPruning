@@ -6,6 +6,8 @@ from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 import numpy as np
 import torch
+import pickle as pkl
+import pandas as pd
 import torch.nn.functional as F
 from packaging import version
 from torch.utils.data.dataloader import DataLoader
@@ -21,34 +23,46 @@ from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 from transformers.trainer import Trainer
 from transformers.trainer_pt_utils import nested_concat, nested_numpify
 from transformers.trainer_utils import (PREFIX_CHECKPOINT_DIR, EvalPrediction,
-									EvaluationStrategy, PredictionOutput,
-									TrainOutput)
+                                        EvaluationStrategy, PredictionOutput,
+                                        TrainOutput)
 from transformers.utils import logging
 from transformers.training_args import TrainingArguments
 
 from args import AdditionalArguments
 from utils.cofi_utils import *
 from utils.utils import *
+import pdb
 
 import wandb
-import pdb
-from pprint import pprint
 
 logger = logging.get_logger(__name__)
 
 glue_tasks = {"cola": "matthews_correlation",
-		  "mnli": "mnli/acc",
-		  "mrpc": "accuracy",
-		  "sst2": "accuracy",
-		  "stsb": "corr",
-		  "qqp": "accuracy",
-		  "qnli": "accuracy",
-		  "rte": "accuracy",
-		  "sst2_aug": "accuracy",
-		  "rte_aug": "accuracy",
-		  "mrpc_aug": "accuracy",
-		  "qnli_aug": "accuracy",
-		  "stsb_aug": "corr",}
+			  "mnli": "mnli/acc",
+			  "mrpc": "accuracy",
+			  "sst2": "accuracy",
+			  "stsb": "corr",
+			  "qqp": "accuracy",
+			  "qnli": "accuracy",
+			  "rte": "accuracy",
+			  "sst2_aug": "accuracy",
+			  "rte_aug": "accuracy",
+			  "mrpc_aug": "accuracy",
+			  "qnli_aug": "accuracy",
+			  "stsb_aug": "corr",}
+
+glue_output_modes = {
+	"cola": "classification",
+	"mnli": "classification",
+	"mnli-mm": "classification",
+	"mrpc": "classification",
+	"sst-2": "classification",
+	"sts-b": "regression",
+	"qqp": "classification",
+	"qnli": "classification",
+	"rte": "classification",
+	"wnli": "classification",
+}
 
 class Eval_Counter():
 	def __init__(self):
@@ -84,6 +98,7 @@ class CoFiTrainer(Trainer):
 			data_collator: Optional[DataCollator] = None,
 			train_dataset: Optional[Dataset] = None,
 			eval_dataset: Optional[Dataset] = None,
+			predict_dataset : Optional[Dataset] = None,
 			tokenizer: Optional[PreTrainedTokenizerBase] = None,
 			model_init: Callable[[], PreTrainedModel] = None,
 			compute_metrics: Optional[Callable[[EvalPrediction], Dict]] = None,
@@ -96,6 +111,8 @@ class CoFiTrainer(Trainer):
 						 eval_dataset, tokenizer, model_init, compute_metrics, **kwargs)
 
 		self.additional_args = additional_args
+		# Instantiate the test dataset here
+		self.test_dataset = predict_dataset
 
 		self.l0_module = l0_module
 		self.prepruning_finetune_steps = 100
@@ -110,7 +127,6 @@ class CoFiTrainer(Trainer):
 		self.teacher_model = teacher_model
 		if self.teacher_model is not None:
 			self.teacher_model = self.teacher_model.to(self.args.device)
-			print('Teacher Model Size : ', calculate_parameters(teacher_model))
 
 		log_level = args.get_process_log_level()
 		logging.set_verbosity(log_level)
@@ -167,13 +183,55 @@ class CoFiTrainer(Trainer):
 													betas=(self.args.adam_beta1,
 															self.args.adam_beta2),
 													eps=self.args.adam_epsilon)
-# 		if self.lr_scheduler is None:
-# 			if self.additional_args.scheduler_type == "linear":
-# 				self.lr_scheduler = get_linear_schedule_with_warmup(
-# 					self.optimizer, num_warmup_steps=self.args.warmup_steps, num_training_steps=num_training_steps
-# 				)
-# 			else:
-# 				self.lr_scheduler = None
+
+		if self.lr_scheduler is None:
+			if self.additional_args.scheduler_type == "linear":
+				self.lr_scheduler = get_linear_schedule_with_warmup(
+					self.optimizer, num_warmup_steps=self.args.warmup_steps, num_training_steps=num_training_steps
+				)
+			else:
+				self.lr_scheduler = None
+	
+	
+	def fit_linear_head(self, epoch_iterator):
+		optimizer = AdamW(
+				self.teacher_model.classifier.parameters(),
+				lr=5e-4,
+				betas=(self.args.adam_beta1, self.args.adam_beta2),
+				eps=self.args.adam_epsilon,
+			)
+		for epoch_ in range(2):
+			total = 0.0
+			for step, inputs in enumerate(epoch_iterator):
+				inputs = self._prepare_inputs(inputs)
+				tr_loss_step = self.compute_loss(self.teacher_model, inputs)
+				tr_loss_step.backward()
+
+				if (step + 1) % self.args.gradient_accumulation_steps == 0 or (
+						len(epoch_iterator) <= self.args.gradient_accumulation_steps
+						and (step + 1) == len(epoch_iterator)
+				):
+					torch.nn.utils.clip_grad_norm_(
+						self.teacher_model.classifier.parameters(), self.args.max_grad_norm)
+
+					optimizer.step()
+					self.teacher_model.zero_grad()
+				total += tr_loss_step.item()
+
+			total /= step
+			# Evaluate on the dev-set
+			self.teacher_model.eval()
+			eval_dataloader = self.get_eval_dataloader()
+			eval_loss = 0
+			with torch.no_grad():
+				for step, inputs in enumerate(eval_dataloader):
+					inputs = self._prepare_inputs(inputs)
+					loss = self.compute_loss(self.teacher_model, inputs)
+					eval_loss += loss.item()
+			eval_loss /= step
+			logger.info('Epoch {} | Train loss : {} | Eval loss : {}'.format(epoch_, total, eval_loss))
+			self.teacher_model.train()
+
 
 	def train(self):
 		train_dataloader = self.get_train_dataloader()
@@ -245,14 +303,16 @@ class CoFiTrainer(Trainer):
 		if self.lagrangian_optimizer is not None:
 			self.lagrangian_optimizer.zero_grad()
 
-		print('We are turning off distillation')
-		self.teacher_model = None
-		
 		disable_tqdm = self.args.disable_tqdm or not self.is_local_process_zero()
 		train_pbar = trange(epochs_trained, int(
 			np.ceil(num_train_epochs)), desc="Epoch", disable=disable_tqdm)
 
 		self.evaluate()
+
+		# By [ldery]
+		# Fit a linear head to the teacher model.
+		if self.additional_args.fit_linear_head:
+			self.fit_linear_head(train_dataloader)
 
 		# training
 		for epoch in range(epochs_trained, int(np.ceil(num_train_epochs))): #! 20 epoch
@@ -270,9 +330,6 @@ class CoFiTrainer(Trainer):
 			epoch_pbar = tqdm(epoch_iterator, desc="Iteration",
 							  disable=disable_tqdm)
 			self.eval_counter.clear()
-			if epoch > -1: # 19: #(epoch / num_train_epochs) > 0.2:
-				print('We are turning off distillation')
-				self.teacher_model = None
 
 			for step, inputs in enumerate(epoch_iterator):
 				if (self.prepruning_finetune_steps > 0) and (self.global_step == self.prepruning_finetune_steps) and (self.l0_module is not None): #! before pruning, run 12272 steps
@@ -298,14 +355,15 @@ class CoFiTrainer(Trainer):
 				lag_loss += lag_loss_step if lag_loss_step is not None else 0.0
 
 				self.total_flos += self.floating_point_ops(inputs)
-
+				
 				if (step + 1) % self.args.gradient_accumulation_steps == 0 or (
 						len(epoch_iterator) <= self.args.gradient_accumulation_steps
 						and (step + 1) == len(epoch_iterator)
 				):
+
 					torch.nn.utils.clip_grad_norm_(
 						model.parameters(), self.args.max_grad_norm)
-					
+
 					self.optimizer.step()
 
 					if self.l0_module is not None and self.l0_optimizer is not None:
@@ -321,9 +379,7 @@ class CoFiTrainer(Trainer):
 					model.zero_grad()
 					if self.l0_module is not None:
 						self.l0_module.zero_grad()
-					
 					self.optimizer.zero_grad()
-
 					if self.l0_optimizer is not None:
 						self.l0_optimizer.zero_grad()
 					if self.lagrangian_optimizer is not None:
@@ -360,7 +416,6 @@ class CoFiTrainer(Trainer):
 						logging_lag_loss_scalar = lag_loss_scalar
 
 						self.log(logs)
-						pprint(loss_terms)
 
 					if self.global_step % self.args.eval_steps == 0:
 						self.evaluate()
@@ -371,6 +426,7 @@ class CoFiTrainer(Trainer):
 					break
 
 			epoch_end = time.time()
+
 			# wandb.log({'epoch':epoch})
 			logger.info(
 				f"Epoch {epoch} finished. Took {round(epoch_end - epoch_start, 2)} seconds.")
@@ -438,6 +494,10 @@ class CoFiTrainer(Trainer):
 				if ii == 0:
 					logger.info(f"Putting zs {zs.keys()} into inputs:")
 				self.fill_inputs_with_zs(zs, inputs) #! use the zs
+
+			if 'Test' in description:
+				del inputs['labels']
+
 			loss, logits, labels = self.prediction_step(
 				model, inputs, prediction_loss_only)
 
@@ -548,6 +608,31 @@ class CoFiTrainer(Trainer):
 				logger.info(f"Saving the best model so far: [Epoch {int(self.epoch)} | Step: {self.global_step} | Model size: {output.metrics['remaining_params'] if 'remaining_params' in output.metrics else 'Full' } | Score: {round(eval_score, 5)}]")
 				self.model.save_pretrained(best_dir)
 
+				# We also want to generate the test set predictions here if that is the case !
+				if self.test_dataset is not None:
+					logger.info(f"Generating Test Set Predictions")
+					test_dataloader = self.get_test_dataloader(self.test_dataset)
+					assert test_dataloader is not None, 'The test dataset loader is none for some reason'
+					test_output = self.prediction_loop(test_dataloader, description="Test")
+
+					preds = test_output.predictions
+					if glue_output_modes[self.model.config.finetuning_task] == "classification":
+						preds = np.argmax(preds, axis=1)
+					elif glue_output_modes[self.model.config.finetuning_task] == "regression":
+						preds = np.squeeze(preds)
+
+					if self.model.config.finetuning_task == 'sts-b':
+						test_pred_label = [tr for tr in preds]
+					else:
+						# Get the label list for the task
+						label_list = self.test_dataset.features["label"].names
+						test_pred_label = [label_list[tr] for tr in preds]
+
+					test_pred = pd.DataFrame({'index': range(len(test_pred_label)), 'prediction': test_pred_label})
+					save_path = os.path.join(best_dir, '{}.tsv'.format(self.model.config.finetuning_task.upper()))
+					test_pred.to_csv(save_path, sep='\t', index=False)
+
+
 		return output.metrics
 
 	def save_model(self, output_dir: Optional[str] = None):
@@ -656,16 +741,15 @@ class CoFiTrainer(Trainer):
 		layer_loss = self.calculate_layer_distillation_loss(teacher_outputs, student_outputs, zs)
 		distill_loss = layer_loss
 
-		ce_distill_loss = torch.nn.MSELoss()(student_outputs['pooler_output'], teacher_outputs['pooler_output'])
-# 		ce_distill_loss = F.kl_div(
-# 			input=F.log_softmax(
-# 				student_outputs[1] / self.additional_args.distill_temp, dim=-1), #! logits: [32,3]
-# 			target=F.softmax(
-# 				teacher_outputs[1] / self.additional_args.distill_temp, dim=-1), #! distill_temp: 2.0
-# 			reduction="batchmean") * (self.additional_args.distill_temp ** 2)
+		ce_distill_loss = F.kl_div(
+			input=F.log_softmax(
+				student_outputs[1] / self.additional_args.distill_temp, dim=-1), #! logits: [32,3]
+			target=F.softmax(
+				teacher_outputs[1] / self.additional_args.distill_temp, dim=-1), #! distill_temp: 2.0
+			reduction="batchmean") * (self.additional_args.distill_temp ** 2)
 
 		loss = self.additional_args.distill_ce_loss_alpha * ce_distill_loss
-		if distill_loss  is not None:
+		if distill_loss is not None:
 			loss += self.additional_args.distill_loss_alpha * distill_loss
 
 		return distill_loss, ce_distill_loss, loss
@@ -686,8 +770,6 @@ class CoFiTrainer(Trainer):
 
 		distill_loss = None
 		distill_ce_loss = None
-		supervised_loss = None
-
 		if self.teacher_model is not None:
 			with torch.no_grad():
 				# only retain inputs of certain keys
@@ -696,22 +778,13 @@ class CoFiTrainer(Trainer):
 				teacher_inputs = {key: inputs[key]
 								  for key in teacher_inputs_keys if key in inputs}
 				self.shortens_inputs(teacher_inputs)
-				del teacher_inputs['labels']
-				teacher_outputs = self.teacher_model.bert(**teacher_inputs)
-
-# 				teacher_outputs = self.teacher_model(**teacher_inputs)
+				teacher_outputs = self.teacher_model(**teacher_inputs)
 			self.shortens_inputs(inputs)
-			del inputs['labels']
-			student_outputs = model.bert(**inputs) #! get the two outputs
-
-# 			student_outputs = model(**inputs) #! get the two outputs
+			student_outputs = model(**inputs) #! get the two outputs
 
 			zs = {key: inputs[key] for key in inputs if "_z" in key} #! extract the zs
 			distill_loss, distill_ce_loss, loss = self.calculate_distillation_loss(
 				teacher_outputs, student_outputs, zs)
-			
-# 			supervised_loss = self.compute_loss(model, inputs)
-# 			loss += supervised_loss
 		else:
 			loss = self.compute_loss(model, inputs)
 
@@ -726,53 +799,19 @@ class CoFiTrainer(Trainer):
 			loss = loss / self.args.gradient_accumulation_steps
 
 		loss.backward()
+		result_dict = {
+						"loss": loss.detach(),
+						"lagrangian_loss": lagrangian_loss.detach() if lagrangian_loss is not None else None,
+						"distill_layer_loss": distill_loss.detach() if distill_loss is not None else None,
+						"distill_ce_loss": distill_ce_loss.detach() if distill_ce_loss is not None else None
+				}
 
 		# wandb.log({"loss": loss.detach(),
 		#         "lagrangian_loss": lagrangian_loss.detach() if lagrangian_loss is not None else None,
 		#         "distill_layer_loss": distill_loss.detach() if distill_loss is not None else None,
 		#         "distill_ce_loss": distill_ce_loss.detach() if distill_ce_loss is not None else None})
-
-		return {"loss": loss.detach(),
-				"lagrangian_loss": lagrangian_loss.detach() if lagrangian_loss is not None else None,
-				"distill_layer_loss": distill_loss.detach() if distill_loss is not None else None,
-				"distill_ce_loss": distill_ce_loss.detach() if distill_ce_loss is not None else None,
-				"supervised_loss": supervised_loss.detach() if supervised_loss is not None else None}
+		return result_dict
 
 	def fill_inputs_with_zs(self, zs, inputs):
 		for key in zs:
 			inputs[key] = zs[key]
-
-			
-# 			no_decay = ["bias", "LayerNorm.weight"]
-# 			freeze_keywords = ["embeddings"]
-# 			other_set = ["bias", "LayerNorm", "classifier"]
-# 			g_small_w_wd = [p for n, p in self.model.named_parameters() if not any(nd in n for nd in other_set) and not any(fk in n for fk in freeze_keywords)]
-# 			g_small_no_wd = [p for n, p in self.model.named_parameters() if ('bias' in n) and ('LayerNorm' not in n) and ('classifier' not in n) and not any(fk in n for fk in freeze_keywords)]
-# 			g_large_w_wd = [p for n, p in self.model.named_parameters() if ('classifier' in n) and not any(fk in n for fk in freeze_keywords)]
-# 			g_large_no_wd = [p for n, p in self.model.named_parameters() if ('LayerNorm' in n) and not any(fk in n for fk in freeze_keywords)]
-
-# 			main_model_params = [
-# 				{
-# 					"params": g_small_w_wd,
-# # 					[p for n, p in self.model.named_parameters() if not any(nd in n for nd in no_decay) and not any(fk in n for fk in freeze_keywords)],
-# 					"weight_decay": self.args.weight_decay,
-# 					"lr": 3e-5, #self.args.learning_rate
-# 				},
-# 				{
-# 					"params": g_small_no_wd,
-# 					"weight_decay": 0.0,
-# 					"lr": 3e-5,
-# 				},
-# 				{
-# 					"params": g_large_w_wd,
-# 					#[p for n, p in self.model.named_parameters() if any(nd in n for nd in no_decay) and not any(fk in n for fk in freeze_keywords)],
-# 					"weight_decay": self.args.weight_decay,
-# 					"lr": 1e-4, #self.args.learning_rate
-# 				},
-# 				{
-# 					"params": g_large_no_wd,
-# 					#[p for n, p in self.model.named_parameters() if any(nd in n for nd in no_decay) and not any(fk in n for fk in freeze_keywords)],
-# 					"weight_decay": 0.0,
-# 					"lr": 1e-4, #self.args.learning_rate
-# 				},
-# 			]

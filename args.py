@@ -29,6 +29,7 @@ class AdditionalArguments():
 	scheduler_type: str = field(default="linear", metadata={"help": "type of scheduler"})
 	fitness_strategy: str = field(default="linear_fit", metadata={"help": "type of fitness strategy. Options are : linear_fit, transrate, embedding_cosine"})
 	freeze_embeddings: bool = field(default=False, metadata={"help": "Whether we should freeze the embeddings."})
+	fit_linear_head:  bool = field(default=False, metadata={"help": "Whether we should fit a linear head to the teacher."})
 
 	pretrained_pruned_model: str = field(default=None, metadata={"help": "Path of pretrained model."})
 
