@@ -19,7 +19,7 @@ training_config = {
 	'bsz' : 16,
 	'y_var': 0.0025,
 	'nepochs' : 20,
-	'reg_weight': 1e-6,
+	'reg_weight': 1e-4, #1e-6,
 	'prior_reg_weight': 1e-2,
 	'patience': 5,
 }
