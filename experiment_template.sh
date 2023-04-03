@@ -15,6 +15,7 @@ conda activate posthoc_mod
 echo $1
 echo $2
 
-#CUDA_VISIBLE_DEVICES=0 ./end_to_end.sh $1 TestOurs bert-base-uncased linear_fit 512 False 200 base 0.1 0 $2 57
-#CUDA_VISIBLE_DEVICES=0 ./end_to_end.sh $1 TestOurs bert-base-uncased linear_fit 512 False 200 base 0.1 0 $2 0
-CUDA_VISIBLE_DEVICES=0 ./end_to_end.sh $1 TestOurs bert-base-uncased linear_fit 512 False 200 base 0.1 0 $2 232323
+CUDA_VISIBLE_DEVICES=0 ./end_to_end.sh $1 TestOurs bert-base-uncased linear_fit 256 False 100 base 0.1 0 $2 57
+CUDA_VISIBLE_DEVICES=0 ./end_to_end.sh $1 TestOurs bert-base-uncased linear_fit 256 False 100 base 0.1 0 $2 0
+CUDA_VISIBLE_DEVICES=0 ./end_to_end.sh $1 TestOurs bert-base-uncased linear_fit 256 False 100 base 0.1 0 $2 232323
+
