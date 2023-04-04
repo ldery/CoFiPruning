@@ -15,12 +15,12 @@ from torch.nn.init import kaiming_normal_
 
 training_config = {
 	'lr' : 1e-4,
-	'var_lr' : 1e-2,
+	'var_lr' : 1.0,
 	'bsz' : 16,
 	'y_var': 0.0025,
 	'nepochs' : 20,
-	'reg_weight': 1e-6,
-	'prior_reg_weight': 1.0,
+	'reg_weight': 0.0,
+	'prior_reg_weight': 5e-1,
 	'patience': 5,
 }
 
@@ -52,8 +52,7 @@ class LinearModel(nn.Module):
 		if reg_scales is None:
 			self.l1_weights = torch.zeros_like(self.score_tensor).fill_(training_config['reg_weight'])
 		else:
-			reg_scales = reg_scales.to(self.score_tensor.device)
-			self.l1_weights = torch.ones_like(self.score_tensor) * reg_scales
+			self.l1_weights = reg_scales.to(self.score_tensor.device).view(self.score_tensor.shape)
 		self.l1_weights.requires_grad = False
 		# TODO [ldery] -- udpdate with relative weights
 
@@ -64,6 +63,8 @@ class LinearModel(nn.Module):
 
 	def regLoss(self):
 		l1 = self.score_tensor.abs()
+		if self.base_mask is not None:
+			l1 = l1 * (self.base_mask.view(l1.shape))
 		return (l1 * self.l1_weights).sum()
 
 	def forward(self, xs):
@@ -96,8 +97,8 @@ class ScoreModel(nn.Module):
 
 		reg_scales = []
 		reg_dict = {
-						'head_z': 10, 'mlp_z' : 1, 
-						'intermediate_z':100, 'hidden_z':10
+						'head_z': 3, 'mlp_z' : 1, 
+						'intermediate_z':10, 'hidden_z':3
 		}
 		for k, v in module_config.items():
 			scale = training_config['reg_weight'] * reg_dict[k]
@@ -142,9 +143,7 @@ class ScoreModel(nn.Module):
 			stds = (self.base_model.variances.exp()).sqrt()
 			preds_ = normed_rand_sample.matmul(self.base_model.score_tensor)
 			stds_ = normed_rand_sample.matmul(stds)
-# 			print('Stds ', stds_.mean().item(), stds_.max().item(), stds_.std().item())
-			total = stds_ #preds_ + stds_
-# 			print('Totals ', total.mean().item(), total.max().item(), total.std().item())
+			total = preds_ + stds_
 			chosen = random_sample[torch.argmax(total)].cpu().squeeze()
 		return chosen
 
@@ -171,7 +170,7 @@ class ScoreModel(nn.Module):
 				for p_ in zip(
 					preds[:3].squeeze().detach().cpu().numpy().tolist(), this_ys[:3].squeeze().detach().cpu().numpy().tolist()):
 					print("Pred {:.3f} | GT {:.3f}".format(*p_))
-				print("Loss {:.5f} | Reg Loss {:.5f}".format(loss / training_config['y_var'] , training_config['reg_weight'] * regLoss))
+				print("Loss {:.5f} | Reg Loss {:.5f}".format(loss, regLoss))
 
 			# Do some logging here
 			with torch.no_grad():
@@ -184,7 +183,7 @@ class ScoreModel(nn.Module):
 
 			if is_train:
 				# Clamp the losses to be within bounds of the training data likelihood.
-				loss = (loss / training_config['y_var'])  + (training_config['reg_weight'] * regLoss)
+				loss = loss + regLoss
 				loss.backward()
 
 				self.score_optim.step()

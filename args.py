@@ -36,7 +36,7 @@ class AdditionalArguments():
 	droprate_init: float = field(default=0.5, metadata={"help": "Init parameter for loga"})
 	quantile_cutoff: float = field(default=0.1, metadata={"help": "Quantile cuttoff for our method"})
 	masks_per_round: int = field(default=500, metadata={"help": "Number of masks to use per-round"})
-	max_prune_rounds: int = field(default=30, metadata={"help": "Max Number of pruning rounds to perform"})
+	max_prune_rounds: int = field(default=50, metadata={"help": "Max Number of pruning rounds to perform"})
 	temperature: float = field(default=2./3., metadata={"help": "Temperature controlling hard concrete distribution"})
 	prepruning_finetune_epochs: int = field(default=1, metadata={"help": "Finetuning epochs before pruning"})
 	lagrangian_warmup_epochs: int = field(default=2, metadata={"help": "Number of epochs for lagrangian warmup"})
