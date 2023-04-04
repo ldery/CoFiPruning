@@ -19,7 +19,7 @@ training_config = {
 	'bsz' : 16,
 	'y_var': 0.0025,
 	'nepochs' : 20,
-	'reg_weight': 1e-4, #1e-6,
+	'reg_weight': 1e-7,
 	'prior_reg_weight': 1e-2,
 	'patience': 5,
 }
@@ -35,11 +35,8 @@ def create_tensor(shape, zero_out=1.0, requires_grad=True, is_cuda=True):
 		weights.requires_grad = True
 	return weights
 
-def get_score_model(config, num_layers, num_players, model_type):
-	if model_type == 'logistic_regression':
-		return LogisticReg(num_players=num_players)
-	elif model_type == 'non-linear':
-		return ScoreModel(config, num_layers=num_layers, num_players=num_players)
+def get_score_model(config, num_layers, num_players, model_type, reg_weight):
+	return ScoreModel(config, num_layers=num_layers, num_players=num_players, reg_weight=reg_weight)
 
 
 class LinearModel(nn.Module):
@@ -49,13 +46,8 @@ class LinearModel(nn.Module):
 		self.variances = nn.parameter.Parameter(create_tensor((num_players + 1, 1))) 
 		self.num_players = num_players
 		self.base_mask = None
-		if reg_scales is None:
-			self.l1_weights = torch.zeros_like(self.score_tensor).fill_(training_config['reg_weight'])
-		else:
-			reg_scales = reg_scales.to(self.score_tensor.device)
-			self.l1_weights = torch.ones_like(self.score_tensor) * reg_scales
+		self.l1_weights = reg_scales.to(self.score_tensor.device).view(self.score_tensor.shape)
 		self.l1_weights.requires_grad = False
-		# TODO [ldery] -- udpdate with relative weights
 
 	def reset_linear(self):
 		del self.score_tensor
@@ -64,14 +56,10 @@ class LinearModel(nn.Module):
 
 	def regLoss(self):
 		l1 = self.score_tensor.abs()
+		if self.base_mask is not None:
+			l1 = l1 * (self.base_mask.view(l1.shape))
 		return (l1 * self.l1_weights).sum()
 
-# 		# This is the loss that takes the variances into account.
-# 		chosen_vars = self.variances if self.base_mask is None else self.variances[self.base_mask > 0]
-# 		chosen_vars = chosen_vars.exp()
-# 		chosen_scores = self.score_tensor if self.base_mask is None else self.score_tensor[self.base_mask > 0]
-# 		reg_loss = (chosen_scores** 2 / chosen_vars).sum()
-# 		return reg_loss
 
 	def forward(self, xs):
 		return torch.matmul(xs, self.score_tensor)
@@ -98,7 +86,7 @@ class LinearModel(nn.Module):
 
 
 class ScoreModel(nn.Module):
-	def __init__(self, module_config, num_layers=12, num_players=None):
+	def __init__(self, module_config, num_layers=12, num_players=None, reg_weight=1e-7):
 		super(ScoreModel, self).__init__()
 
 		reg_scales = []
@@ -106,17 +94,14 @@ class ScoreModel(nn.Module):
 						'head_z': 10, 'mlp_z' : 1, 
 						'intermediate_z':100, 'hidden_z':10
 		}
-# 		reg_dict = {
-# 						'head_z': 1, 'mlp_z' : 1, 
-# 						'intermediate_z':1, 'hidden_z':1
-# 		}
 		for k, v in module_config.items():
-			scale = training_config['reg_weight'] * reg_dict[k]
+			scale = reg_weight * reg_dict[k]
 			reg_scales.append(torch.ones(v.numel()) * scale)
-		reg_scales.append(torch.tensor([training_config['reg_weight']]))
+		reg_scales.append(torch.tensor([reg_weight]))
 		reg_scales = torch.concat(reg_scales)
 		self.base_model = LinearModel(num_players, reg_scales=reg_scales)
 		self.loss_fn = nn.MSELoss()
+
 
 	def config_to_model_info(self, config, use_all=False):
 		base_vec = []
@@ -180,7 +165,7 @@ class ScoreModel(nn.Module):
 				for p_ in zip(
 					preds[:3].squeeze().detach().cpu().numpy().tolist(), this_ys[:3].squeeze().detach().cpu().numpy().tolist()):
 					print("Pred {:.3f} | GT {:.3f}".format(*p_))
-				print("Loss {:.5f} | Reg Loss {:.5f}".format(loss / training_config['y_var'] , training_config['reg_weight'] * regLoss))
+				print("Loss {:.5f} | Reg Loss {:.5f}".format(loss, regLoss))
 
 			# Do some logging here
 			with torch.no_grad():
@@ -193,7 +178,7 @@ class ScoreModel(nn.Module):
 
 			if is_train:
 				# Clamp the losses to be within bounds of the training data likelihood.
-				loss = (loss / training_config['y_var'])  + (training_config['reg_weight'] * regLoss)
+				loss = loss  +  regLoss
 				loss.backward()
 
 				self.score_optim.step()

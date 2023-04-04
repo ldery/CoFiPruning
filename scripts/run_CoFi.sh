@@ -55,6 +55,8 @@ do_local_thresholding=${13}
 masks_per_round=${14}
 model_name_or_path=${15}
 quantilethreshold=${16}
+shapley_reg_weight=${18}
+
 
 scheduler_type=linear
 
@@ -110,6 +112,7 @@ if [[ $do_local_thresholding == True ]]; then
 	   --eval_steps ${eval_steps} \
 	   --evaluation_strategy steps \
 	   --seed ${seed} \
+	   --shapley_reg_weight ${shapley_reg_weight} \
 	   --pruning_type ${pruning_type} \
      --pretrained_pruned_model ${pretrained_pruned_model} \
      --target_sparsity $target_sparsity \
@@ -148,6 +151,7 @@ else
 	   --eval_steps ${eval_steps} \
 	   --evaluation_strategy steps \
 	   --seed ${seed} \
+	   --shapley_reg_weight ${shapley_reg_weight} \
 	   --pruning_type ${pruning_type} \
      --pretrained_pruned_model ${pretrained_pruned_model} \
      --target_sparsity $target_sparsity \
