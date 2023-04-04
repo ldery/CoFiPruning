@@ -1,5 +1,5 @@
-# #!/bin/bash
-# sbatch <<EOT
+#!/bin/bash
+sbatch <<EOT
 #!/bin/bash
 #SBATCH --cpus-per-task=4
 #SBATCH --mem=64G
