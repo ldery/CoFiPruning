@@ -9,8 +9,8 @@ sbatch <<EOT
 #SBATCH --exclude=tir-0-36
 #SBATCH --gres gpu:v100:1
 
-# source ~/.bashrc
-# conda activate posthoc_mod
+source ~/.bashrc
+conda activate posthoc_mod
 
 echo $1
 echo $2
