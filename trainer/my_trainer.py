@@ -155,19 +155,22 @@ class My_Trainer(Trainer):
 		mask = {}
 		anti_mask = {} if paired else None
 		pos_ = 0
+		for k in self.arch_comp_keys:
+			v = self.base_zs[k]
+			if candidate is not None:
+				mask[k] = (candidate[pos_:(pos_ + v.numel())]).view(v.shape)
+				pos_ += v.numel()
+			else:
+				mask[k] = torch.bernoulli(v)
+			if anti_mask is not None:
+				anti_mask[k] = (1.0 - mask[k]) * (v > 0.0) # only generate anti-mask for active nodes
+
 		for k, v in self.base_zs.items():
 			if k in self.arch_comp_keys:
-				if candidate is not None:
-					mask[k] = (candidate[pos_:(pos_ + v.numel())]).view(v.shape)
-					pos_ += v.numel()
-				else:
-					mask[k] = torch.bernoulli(v)
-				if anti_mask is not None:
-					anti_mask[k] = (1.0 - mask[k]) * (v > 0.0) # only generate anti-mask for active nodes
-			else:
-				mask[k] = torch.ones_like(v)
-				if anti_mask is not None:
-					anti_mask[k] = torch.ones_like(v)
+				continue
+			mask[k] = torch.ones_like(v)
+			if anti_mask is not None:
+				anti_mask[k] = torch.ones_like(v)
 		return (mask, anti_mask) if paired else (mask, )
 
 	def get_next_batch(self, is_train=True):

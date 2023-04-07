@@ -91,8 +91,8 @@ class ScoreModel(nn.Module):
 
 		reg_scales = []
 		reg_dict = {
-						'head_z': 2, 'mlp_z' : 1, 
-						'intermediate_z':4, 'hidden_z':2
+						'head_z': 1, 'mlp_z' : 1, 
+						'intermediate_z':1, 'hidden_z':1
 		}
 		for k, v in module_config.items():
 			scale = reg_weight * reg_dict[k]
