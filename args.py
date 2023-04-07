@@ -30,6 +30,7 @@ class AdditionalArguments():
 	fitness_strategy: str = field(default="linear_fit", metadata={"help": "type of fitness strategy. Options are : linear_fit, transrate, embedding_cosine"})
 	freeze_embeddings: bool = field(default=False, metadata={"help": "Whether we should freeze the embeddings."})
 	fit_linear_head:  bool = field(default=False, metadata={"help": "Whether we should fit a linear head to the teacher."})
+	shapley_reg_weight : float = field(default=0.0, metadata={"help": "Regularization weight for shapley values"})
 
 	pretrained_pruned_model: str = field(default=None, metadata={"help": "Path of pretrained model."})
 

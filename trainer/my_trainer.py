@@ -143,12 +143,11 @@ class My_Trainer(Trainer):
 		self.val_batcher = iter(self.get_eval_dataloader())
 		self.fitness_strategy = self.additional_args.fitness_strategy
 		self.masks_per_round = self.additional_args.masks_per_round
-		
 		# Setup the scoring model here
 		base_zs_clone = {}
 		for k in self.arch_comp_keys:
 			base_zs_clone[k] = self.base_zs[k]
-		self.scoring_model = get_score_model(base_zs_clone, num_layers=self.nlayers, num_players=num_players, model_type='non-linear')
+		self.scoring_model = get_score_model(base_zs_clone, num_layers=self.nlayers, num_players=num_players, model_type='non-linear', reg_weight=self.additional_args.shapley_reg_weight)
 		self.scoring_model.cuda()
 
 	def gen_random_mask(self, paired=False):
