@@ -270,8 +270,9 @@ class My_Trainer(Trainer):
 		base_zs_clone = {}
 		for k in self.arch_comp_keys:
 			base_zs_clone[k] = self.base_zs[k]
+		
 		self.scoring_model.set_base_mask(base_zs_clone)
-
+# 		self.scoring_model.reset_linear()
 		return occupancies
 
 	def reset_base_zs_global(self):
@@ -302,6 +303,7 @@ class My_Trainer(Trainer):
 		for k in self.arch_comp_keys:
 			base_zs_clone[k] = self.base_zs[k]
 		self.scoring_model.set_base_mask(base_zs_clone)
+# 		self.scoring_model.reset_linear()
 		return occupancies
 
 	def check_and_retrieve_past_runs(self):

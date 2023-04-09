@@ -19,5 +19,5 @@ echo $4
 echo $5
 
 CUDA_VISIBLE_DEVICES=0 ./end_to_end.sh $1 $2 bert-$3-uncased linear_fit 256 False 100 $3 0.1 0 $4 57 $5
-CUDA_VISIBLE_DEVICES=0 ./end_to_end.sh $1 $2 bert-$3-uncased linear_fit 256 False 100 $3 0.1 0 $4 0 $5
-CUDA_VISIBLE_DEVICES=0 ./end_to_end.sh $1 $2 bert-$3-uncased linear_fit 256 False 100 $3 0.1 0 $4 232323 $5
+# CUDA_VISIBLE_DEVICES=0 ./end_to_end.sh $1 $2 bert-$3-uncased linear_fit 256 False 100 $3 0.1 0 $4 0 $5
+# CUDA_VISIBLE_DEVICES=0 ./end_to_end.sh $1 $2 bert-$3-uncased linear_fit 256 False 100 $3 0.1 0 $4 232323 $5

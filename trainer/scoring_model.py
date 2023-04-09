@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 from torch.optim import Adam, SGD
+from torch.optim.lr_scheduler import ReduceLROnPlateau
 import torch.nn.functional as F
 import numpy as np
 import math
@@ -11,16 +12,16 @@ from utils import *
 from pprint import pprint
 from copy import deepcopy
 from torch.nn.init import kaiming_normal_
-
+from sklearn.metrics import r2_score
+from collections import Counter
 
 training_config = {
-	'lr' : 1e-4,
+	'lr' : 5e-4,
 	'var_lr' : 1.0,
 	'bsz' : 16,
-	'y_var': 0.0025,
+	'y_var': 0.0001,#25,
 	'nepochs' : 20,
-	'reg_weight': 1e-7,
-	'prior_reg_weight': 5e-1,
+	'prior_reg_weight': 2.0,
 	'patience': 5,
 }
 
@@ -43,7 +44,7 @@ class LinearModel(nn.Module):
 	def __init__(self, num_players, reg_scales=None):
 		super(LinearModel, self).__init__()
 		self.score_tensor = nn.parameter.Parameter(create_tensor((num_players + 1, 1)))
-		self.variances = nn.parameter.Parameter(create_tensor((num_players + 1, 1))) 
+		self.variances = nn.parameter.Parameter(create_tensor((num_players + 1, 1)) - np.log(num_players**2)) 
 		self.num_players = num_players
 		self.base_mask = None
 		self.l1_weights = reg_scales.to(self.score_tensor.device).view(self.score_tensor.shape)
@@ -51,8 +52,10 @@ class LinearModel(nn.Module):
 
 	def reset_linear(self):
 		del self.score_tensor
+		del self.variances
 		self.score_tensor = nn.parameter.Parameter(create_tensor((self.num_players + 1, 1)))
-		self.variances = nn.parameter.Parameter(create_tensor((self.num_players + 1, 1)))
+		init_scale = - np.log((self.base_mask.sum().item())**2)
+		self.variances = nn.parameter.Parameter(create_tensor((self.num_players + 1, 1)) + init_scale)
 
 	def regLoss(self):
 		l1 = self.score_tensor.abs()
@@ -71,13 +74,16 @@ class LinearModel(nn.Module):
 			stds = self.variances.detach().exp().sqrt()
 
 			active_preds = predictions[base_mask > 0]
+			base_mask[-1] = 0
 			active_stds = stds[base_mask > 0]
+			base_mask[-1] = 1
 
 		stats = active_preds.mean().item(), active_preds.std().item(), active_preds.max().item(), active_preds.min().item()
 		print("Predictions vals : Mean {:.7f}, Std {:.7f}, Max {:.7f}, Min {:.7f}".format(*stats))
 
 		stats = active_stds.mean().item(), active_stds.std().item(), active_stds.max().item(), active_stds.min().item()
 		print("Predictions Stds : Mean {:.7f}, Std {:.7f}, Max {:.7f}, Min {:.7f}".format(*stats))
+
 		return predictions[:-1] # Do not include the last entry because this is the bias
 
 	def set_base_mask(self, base_mask):
@@ -100,7 +106,11 @@ class ScoreModel(nn.Module):
 		reg_scales = torch.concat(reg_scales)
 		self.base_model = LinearModel(num_players, reg_scales=reg_scales)
 		self.loss_fn = nn.MSELoss()
+		self.candidate_buffer = []
 		self.curr_norm = 1.0
+	
+	def reset_linear(self):
+		self.base_model.reset_linear()
 
 	def config_to_model_info(self, config, use_all=False):
 		base_vec = []
@@ -120,28 +130,34 @@ class ScoreModel(nn.Module):
 
 	def get_scores(self, base_mask):
 		return self.base_model.get_scores(self.config_to_model_info(base_mask))
-	
-	# TODO [ldery] -- inspect this function closer
-	def get_candidate(self, pool_size=1000):
-		pool_size = 1 if self.base_model.base_mask is None else pool_size
-		base_set = torch.zeros(pool_size, self.base_model.num_players + 1, device=self.base_model.score_tensor.device) + 0.5
-		random_sample = torch.bernoulli(base_set)
-		if self.base_model.base_mask is None:
-			return random_sample.cpu().squeeze()
 
-		random_sample *= self.base_model.base_mask
-		random_sample[-1] = 0
-		normed_rand_sample = random_sample / self.curr_norm
-		# Do a selection based on UCB
-		with torch.no_grad():
-			stds = (self.base_model.variances.exp()).sqrt()
-			preds_ = normed_rand_sample.matmul(self.base_model.score_tensor)
-			stds_ = normed_rand_sample.matmul(stds)
-			total = preds_ + stds_
-			chosen = random_sample[torch.argmax(total)].cpu().squeeze()
-		return chosen
+	def get_candidate(self, pool_size=10000):
+		if len(self.candidate_buffer) == 0: 
+			pool_size = 1 if self.base_model.base_mask is None else pool_size
+			base_set = torch.zeros(pool_size, self.base_model.num_players + 1, device=self.base_model.score_tensor.device) + 0.5
+			random_sample = torch.bernoulli(base_set)
+			if self.base_model.base_mask is None:
+				return random_sample.cpu().squeeze()
 
-	def run_epoch(self, xs, ys, is_train=True):
+			random_sample *= self.base_model.base_mask
+			random_sample[-1] = 1
+			normed_rand_sample = random_sample / self.curr_norm
+
+			# Do a selection based on UCB
+			with torch.no_grad():
+				stds = (self.base_model.variances.exp()).sqrt()
+				preds_ = normed_rand_sample.matmul(self.base_model.score_tensor)
+
+				normed_rand_sample[-1] = 0
+				stds_ = normed_rand_sample.matmul(stds)
+				total = (preds_ + stds_).squeeze()
+				chosen_idx = torch.argsort(total)[-10:]
+				chosen = random_sample[chosen_idx].cpu()
+				self.candidate_buffer.extend(chosen.unbind())
+
+		return self.candidate_buffer.pop()
+
+	def run_epoch(self, epoch_, xs, ys, is_train=True):
 		# generate a permutation
 		perm = np.random.permutation(len(ys))
 		running_loss_avg = 0.0
@@ -188,33 +204,35 @@ class ScoreModel(nn.Module):
 		if not is_train:
 			self.base_model.train()
 		return running_loss_avg, max_error, min_error
-	
-	# TODO [ldery] -- inspect this function closer
+
+
 	def fit_variances(self, tr, ts):
 
 		def print_state(desc):
 			with torch.no_grad():
-				chosen = self.base_model.variances.exp().sqrt()
+				chosen = (self.base_model.variances.exp().sqrt())[:-1]
 				if self.base_model.base_mask is not None:
-					chosen = chosen[:-1][self.base_model.base_mask[:-1] > 0] 
+					chosen = chosen[self.base_model.base_mask[:-1] > 0] 
 				mean_, max_, min_ = chosen.mean().item(), chosen.max().item(), chosen.min().item()
 				print('\t', desc, '[Vars] Mean : {:.7f} | Max : {:.7f} | Min : {:.7f}'.format(mean_, max_, min_))
 
 		print_state('Before Iter')
 
+		# We are removing the last dimension to make the optimization more stable
 		tr_xs, tr_ys = tr
-		tr_xs = torch.stack(tr_xs).float().cuda()
+		tr_xs = torch.stack(tr_xs)[:, :-1].float().cuda()
 		tr_ys = tr_ys.view(1, -1)
 
 		ts_xs, ts_ys = ts
-		ts_xs = torch.stack(ts_xs).float().cuda()
+		ts_xs = torch.stack(ts_xs)[:, :-1].float().cuda()
 		ts_ys = ts_ys.view(1, -1)
 		
 		var_optim = Adam([self.base_model.variances], lr=training_config['var_lr'])
 
 		def marginal_likelihood(xs, ys):
-			C_mat = torch.eye(ys.shape[-1], device=ys.device) * training_config['y_var']
-			C_mat += (xs * self.base_model.variances.exp().T).matmul(xs.T)
+			vars_ = (self.base_model.variances.exp().T)[:, :-1] / training_config['y_var']
+			C_mat = torch.eye(ys.shape[-1], device=ys.device)
+			C_mat += (xs * vars_).matmul(xs.T)
 			l1 = ys.matmul(torch.inverse(C_mat)).matmul(ys.T)
 			l2 = torch.logdet(C_mat)
 			return l1, l2
@@ -222,8 +240,11 @@ class ScoreModel(nn.Module):
 		best_loss, clone = 1e10, None
 		for iter_ in range(training_config['nepochs']):
 			loss_terms = marginal_likelihood(tr_xs, tr_ys)
-			loss = loss_terms[0] + training_config['prior_reg_weight'] * loss_terms[1]
-			print('[Epoch {}] | Loss : {:.7f} | T1 : {:.7f} | T2 : {:.7f} '.format(iter_, loss.item(), loss_terms[0].item(), training_config['prior_reg_weight'] * loss_terms[1].item()))
+			reg_term = training_config['prior_reg_weight'] * loss_terms[1]
+			loss = loss_terms[0] + reg_term #torch.clamp(reg_term, min=0.0)
+			print('[Epoch {}] | Loss : {:.7f} | T1 : {:.7f} | T2 : {:.7f} '.format(
+				iter_, loss.item(), loss_terms[0].item(), reg_term.item())
+			)
 
 			loss.backward()
 			var_optim.step()
@@ -231,7 +252,8 @@ class ScoreModel(nn.Module):
 
 			with torch.no_grad():
 				loss_terms = marginal_likelihood(ts_xs, ts_ys)
-				loss = loss_terms[0] + training_config['prior_reg_weight'] * loss_terms[1]
+				reg_term = training_config['prior_reg_weight'] * loss_terms[1]
+				loss = loss_terms[0] + reg_term #torch.clamp(reg_term, min=0.0)
 			# check the validation performance and cache
 			if loss.item() < best_loss:
 				print('New Best Variance Model Achieved - old = {:.7f} | new = {:.7f}'.format(best_loss, loss.item()))
@@ -264,14 +286,14 @@ class ScoreModel(nn.Module):
 
 		# Setup the optimizer.
 		self.score_optim = Adam([self.base_model.score_tensor], lr=training_config['lr'])
-
+		lr_scheduler = ReduceLROnPlateau(self.score_optim, mode='min', factor=0.5, patience=5, verbose=True, min_lr=1e-5)
 		best_loss, clone, since_best = 1e10, None, 0
 		for epoch_ in range(training_config['nepochs']):
 
 			print('Epoch - ', epoch_)
-			run_out = self.run_epoch(tr_xs, tr_ys)
+			run_out = self.run_epoch(epoch_, tr_xs, tr_ys)
 			print('Epoch {} [Trn] | Loss : {:.5f} | Max Error : {:.5f} | Min Error : {:.5f}'.format(epoch_, *run_out))
-			run_out = self.run_epoch(ts_xs, ts_ys, is_train=False)
+			run_out = self.run_epoch(epoch_, ts_xs, ts_ys, is_train=False)
 			print('Epoch {} [Tst] | Loss : {:.5f} | Max Error : {:.5f} | Min Error : {:.5f}'.format(epoch_, *run_out))
 
 			if run_out[0] < best_loss:
@@ -280,9 +302,26 @@ class ScoreModel(nn.Module):
 				clone = deepcopy(self.base_model)
 				since_best = 0
 
+			lr_scheduler.step(run_out[1]) # step based on the max error
 			since_best += 1
-			if since_best > 3:
+			if since_best > 10:
 				break
 
 		del self.base_model
 		self.base_model = clone
+
+		with torch.no_grad():
+			ts_xs = torch.stack(ts_xs).float().cuda()
+			ts_ys = ts_ys.cpu().numpy()
+			with torch.no_grad():
+				preds = self.base_model.forward(ts_xs).squeeze()
+				preds = preds.detach().cpu().numpy()
+
+			our_coef_det = r2_score(ts_ys, preds)
+			base_pred = np.ones_like(ts_ys) * tr_ys.mean().item()
+			base_coef_det = r2_score(ts_ys, base_pred)
+			print('Our R^2 = {:.4f} | Naive Mean R^2 = {:.4f}'.format(our_coef_det, base_coef_det))
+			our_max_err = max(np.abs(ts_ys - preds))
+			base_maxerr = max(np.abs(ts_ys - base_pred))
+			print('Our MaxError = {:.4f} | Naive Mean MaxErr = {:.4f}'.format(our_max_err, base_maxerr))
+
