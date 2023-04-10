@@ -16,11 +16,11 @@ from sklearn.metrics import r2_score
 from collections import Counter
 
 training_config = {
-	'lr' : 5e-4,
+	'lr' : 1e-4,
 	'var_lr' : 1.0,
 	'bsz' : 16,
 	'y_var': 0.0001,#25,
-	'nepochs' : 20,
+	'nepochs' : 30,
 	'prior_reg_weight': 2.0,
 	'patience': 5,
 }
@@ -140,7 +140,7 @@ class ScoreModel(nn.Module):
 				return random_sample.cpu().squeeze()
 
 			random_sample *= self.base_model.base_mask
-			random_sample[-1] = 1
+			random_sample[:, -1] = 1
 			normed_rand_sample = random_sample / self.curr_norm
 
 			# Do a selection based on UCB
@@ -148,7 +148,7 @@ class ScoreModel(nn.Module):
 				stds = (self.base_model.variances.exp()).sqrt()
 				preds_ = normed_rand_sample.matmul(self.base_model.score_tensor)
 
-				normed_rand_sample[-1] = 0
+				normed_rand_sample[:, -1] = 0
 				stds_ = normed_rand_sample.matmul(stds)
 				total = (preds_ + stds_).squeeze()
 				chosen_idx = torch.argsort(total)[-10:]
@@ -237,7 +237,7 @@ class ScoreModel(nn.Module):
 			l2 = torch.logdet(C_mat)
 			return l1, l2
 
-		best_loss, clone = 1e10, None
+		best_loss, clone, since_best = 1e10, None, 0
 		for iter_ in range(training_config['nepochs']):
 			loss_terms = marginal_likelihood(tr_xs, tr_ys)
 			reg_term = training_config['prior_reg_weight'] * loss_terms[1]
@@ -259,6 +259,11 @@ class ScoreModel(nn.Module):
 				print('New Best Variance Model Achieved - old = {:.7f} | new = {:.7f}'.format(best_loss, loss.item()))
 				best_loss = loss.item()
 				clone = deepcopy(self.base_model)
+				since_best = 0
+
+			since_best += 1
+			if since_best > 5:
+				break
 
 		del self.base_model
 		self.base_model = clone
@@ -281,12 +286,11 @@ class ScoreModel(nn.Module):
 		ts_xs, ts_ys = [xs[i] / normalization for i in tst_list], [ys[i] for i in tst_list]
 		ts_ys  = torch.tensor(ts_ys).float().cuda()
 
-
 		self.fit_variances((tr_xs, tr_ys), (ts_xs, ts_ys))
 
 		# Setup the optimizer.
 		self.score_optim = Adam([self.base_model.score_tensor], lr=training_config['lr'])
-		lr_scheduler = ReduceLROnPlateau(self.score_optim, mode='min', factor=0.5, patience=5, verbose=True, min_lr=1e-5)
+		lr_scheduler = ReduceLROnPlateau(self.score_optim, mode='min', factor=0.5, patience=3, verbose=True, min_lr=1e-5)
 		best_loss, clone, since_best = 1e10, None, 0
 		for epoch_ in range(training_config['nepochs']):
 
@@ -302,9 +306,9 @@ class ScoreModel(nn.Module):
 				clone = deepcopy(self.base_model)
 				since_best = 0
 
-			lr_scheduler.step(run_out[1]) # step based on the max error
+			lr_scheduler.step(run_out[0]) # step based on the max error
 			since_best += 1
-			if since_best > 10:
+			if since_best > 5:
 				break
 
 		del self.base_model
@@ -324,4 +328,7 @@ class ScoreModel(nn.Module):
 			our_max_err = max(np.abs(ts_ys - preds))
 			base_maxerr = max(np.abs(ts_ys - base_pred))
 			print('Our MaxError = {:.4f} | Naive Mean MaxErr = {:.4f}'.format(our_max_err, base_maxerr))
+			our_loss = np.sqrt(((preds - ts_ys)**2).mean())
+			naive_loss = np.sqrt(((base_pred - ts_ys)**2).mean())
+			print('Our Loss = {:.5f} | Naive Mean Loss = {:.5f}'.format(our_loss, naive_loss))
 
