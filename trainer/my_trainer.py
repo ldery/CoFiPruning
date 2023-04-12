@@ -42,6 +42,8 @@ from .scoring_model import *
 import wandb
 import pdb
 
+# wandb.login()
+
 logger = logging.get_logger(__name__)
 
 glue_tasks = {"cola": "matthews_correlation",
@@ -143,12 +145,34 @@ class My_Trainer(Trainer):
 		self.val_batcher = iter(self.get_eval_dataloader())
 		self.fitness_strategy = self.additional_args.fitness_strategy
 		self.masks_per_round = self.additional_args.masks_per_round
+		
+		self.wandb = None
+# 		self.setup_wandb()
+
 		# Setup the scoring model here
 		base_zs_clone = {}
 		for k in self.arch_comp_keys:
 			base_zs_clone[k] = self.base_zs[k]
-		self.scoring_model = get_score_model(base_zs_clone, num_layers=self.nlayers, num_players=num_players, model_type='non-linear', reg_weight=self.additional_args.shapley_reg_weight)
+		self.scoring_model = get_score_model(base_zs_clone, num_layers=self.nlayers, num_players=num_players, model_type='non-linear', reg_weight=self.additional_args.shapley_reg_weight, wandb=self.wandb)
 		self.scoring_model.cuda()
+
+
+	def setup_wandb(self):
+		# start a new wandb run to track this script
+		wandb.init(
+			# set the wandb project where this run will be logged
+			project="Model Pruning",
+			config={
+				'fitness_strategy': self.additional_args.fitness_strategy, 
+				'masks_per_round': self.additional_args.masks_per_round,
+				'reg_weight': self.additional_args.shapley_reg_weight,
+				'quantile_cutoff': self.additional_args.quantile_cutoff,
+				'local_thresholding': self.additional_args.do_local_thresholding,
+				'with_exploration': True,
+				'output_dir': self.args.output_dir
+			}
+		)
+		self.wandb = wandb
 
 	def gen_random_mask(self, paired=False):
 		candidate = self.scoring_model.get_candidate()
@@ -391,9 +415,9 @@ class My_Trainer(Trainer):
 			our_perf = self.get_mask_perf(cur_best_mask)
 			print('\t', '[{}] Best Random Perf : {:.3f}. Our Perf : {:.3f}'.format(self.fitness_strategy, best_perf, our_perf))
 			if self.additional_args.fitness_strategy != 'linear_fit':
-				random_perf = self.get_mask_perf(best_random_mask, fitness_strategy='linear_fit') if best_random_mask else None
+				best_perf = self.get_mask_perf(best_random_mask, fitness_strategy='linear_fit') if best_random_mask else None
 				our_perf = self.get_mask_perf(cur_best_mask, fitness_strategy='linear_fit')
-				print('\t', '[Linear Fit]| Best Random Perf : {:.3f}. Our Perf : {:.3f}'.format(random_perf, our_perf))
+				print('\t', '[Linear Fit]| Best Random Perf : {:.3f}. Our Perf : {:.3f}'.format(best_perf, our_perf))
 
 			# Caching for saving in case this is the last round
 			self.best_random_mask = best_random_mask
@@ -403,6 +427,14 @@ class My_Trainer(Trainer):
 
 			cur_sparsity = self.calculate_model_sparsity(cur_best_mask, initial_occupancy)
 			print('\t', 'Current Sparsity Level : {:.3f}'.format(cur_sparsity))
+
+			if self.wandb is not None:
+				self.wandb.log({
+					'epoch': round_,
+					'acc/random': best_perf, 'acc/selected': our_perf,
+					'sparsity': cur_sparsity
+				})
+
 			if abs(cur_sparsity - self.additional_args.target_sparsity) < self.acceptable_sparsity_delta:
 				break
 
@@ -410,6 +442,9 @@ class My_Trainer(Trainer):
 				print('\t', 'We overshot. Post Hoc Fix with Module Perfs Recommended')
 				break
 			prev_occ_dict = this_occ_dict
+
+		if self.wandb is not None:
+			self.wandb.finish()
 
 
 	def calculate_model_sparsity(self, mask, initial_occupancy):

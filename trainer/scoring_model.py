@@ -16,7 +16,7 @@ from sklearn.metrics import r2_score
 from collections import Counter
 
 training_config = {
-	'lr' : 1e-4,
+	'lr' :1e-4,
 	'var_lr' : 1.0,
 	'bsz' : 16,
 	'y_var': 0.0001,#25,
@@ -36,8 +36,8 @@ def create_tensor(shape, zero_out=1.0, requires_grad=True, is_cuda=True):
 		weights.requires_grad = True
 	return weights
 
-def get_score_model(config, num_layers, num_players, model_type, reg_weight):
-	return ScoreModel(config, num_layers=num_layers, num_players=num_players, reg_weight=reg_weight)
+def get_score_model(config, num_layers, num_players, model_type, reg_weight, wandb):
+	return ScoreModel(config, num_layers=num_layers, num_players=num_players, reg_weight=reg_weight, wandb=wandb)
 
 
 class LinearModel(nn.Module):
@@ -58,10 +58,15 @@ class LinearModel(nn.Module):
 		self.variances = nn.parameter.Parameter(create_tensor((self.num_players + 1, 1)) + init_scale)
 
 	def regLoss(self):
-		l1 = self.score_tensor.abs()
-		if self.base_mask is not None:
-			l1 = l1 * (self.base_mask.view(l1.shape))
-		return (l1 * self.l1_weights).sum()
+		inv_variances = 1.0 / self.variances.exp()
+		inv_variances *= self.l1_weights
+		weighted_l2 = (self.score_tensor**2  * inv_variances)[:-1, :]
+		return weighted_l2.sum()
+		
+# 		l1 = self.score_tensor.abs()
+# 		if self.base_mask is not None:
+# 			l1 = l1 * (self.base_mask.view(l1.shape))
+# 		return (l1 * self.l1_weights).sum()
 
 
 	def forward(self, xs):
@@ -91,7 +96,7 @@ class LinearModel(nn.Module):
 		assert self.base_mask[-1] == 1, 'The bias term should be on!'
 
 class ScoreModel(nn.Module):
-	def __init__(self, module_config, num_layers=12, num_players=None, reg_weight=1e-7):
+	def __init__(self, module_config, num_layers=12, num_players=None, reg_weight=1e-7, wandb=None):
 		super(ScoreModel, self).__init__()
 
 		reg_scales = []
@@ -108,6 +113,8 @@ class ScoreModel(nn.Module):
 		self.loss_fn = nn.MSELoss()
 		self.candidate_buffer = []
 		self.curr_norm = 1.0
+		self.wandb = wandb
+		self.overall_iter = 0
 	
 	def reset_linear(self):
 		self.base_model.reset_linear()
@@ -151,6 +158,13 @@ class ScoreModel(nn.Module):
 				normed_rand_sample[:, -1] = 0
 				stds_ = normed_rand_sample.matmul(stds)
 				total = (preds_ + stds_).squeeze()
+				stats = total.mean().item(), total.max().item(), total.min().item()
+				if self.wandb is not None:
+					self.wandb.log({
+						'epoch': self.overall_iter, 'candidates/mean': stats[0],
+						'candidates/max': stats[1], 'candidates/min': stats[2]
+					})
+				print('[Exp] Mean : {:.4f} | Max : {:.4f} | Min : {:.4f}'.format(*stats))
 				chosen_idx = torch.argsort(total)[-10:]
 				chosen = random_sample[chosen_idx].cpu()
 				self.candidate_buffer.extend(chosen.unbind())
@@ -271,6 +285,7 @@ class ScoreModel(nn.Module):
 
 
 	def update_with_info(self, run_info):
+		self.overall_iter += 1
 		xs, ys = run_info
 		normalization = self.base_model.num_players if self.base_model.base_mask is None else self.base_model.base_mask.sum().item()
 		normalization = np.sqrt(normalization)
@@ -331,4 +346,11 @@ class ScoreModel(nn.Module):
 			our_loss = np.sqrt(((preds - ts_ys)**2).mean())
 			naive_loss = np.sqrt(((base_pred - ts_ys)**2).mean())
 			print('Our Loss = {:.5f} | Naive Mean Loss = {:.5f}'.format(our_loss, naive_loss))
+			if self.wandb is not None:
+				self.wandb.log({
+					'epoch': self.overall_iter,
+					'r^2/ours': our_coef_det, 'r^2/naive': base_coef_det,
+					'loss/ours': our_loss, 'loss/naive': naive_loss,
+					'maxerr/ours': our_max_err, 'maxerr/naive': base_maxerr,
+				})
 
