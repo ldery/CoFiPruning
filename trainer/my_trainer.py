@@ -125,9 +125,12 @@ class My_Trainer(Trainer):
 		logger.setLevel(log_level)
 		
 		# Setup for our method
-		self.arch_comp_keys = ['head_z', 'mlp_z', 'intermediate_z', 'hidden_z']
+		self.arch_comp_keys = ['head_z', 'intermediate_z', 'hidden_z'] #'intermediate_z',  'mlp_z', 'head_layer_z'
 
 		base_zs = self.l0_module.forward(training=False)
+# 		self.arch_comp_keys = list(base_zs.keys())
+# 		print(self.arch_comp_keys)
+
 		self.base_zs = {}
 		num_players = 0
 		for k, v in base_zs.items():
@@ -195,6 +198,14 @@ class My_Trainer(Trainer):
 			mask[k] = torch.ones_like(v)
 			if anti_mask is not None:
 				anti_mask[k] = torch.ones_like(v)
+
+		# If a layer ffn is turned off, it turns off all intermediates.
+		mask['intermediate_z'] = (mask['mlp_z'] > 0).view(-1, 1, 1, 1) * mask['intermediate_z']
+		anti_mask['intermediate_z'] = (anti_mask['mlp_z'] > 0).view(-1, 1, 1, 1) * anti_mask['intermediate_z']
+		
+		# If an attention layer is turned off, it turns all the heads.
+		mask['head_z'] = (mask['head_layer_z'] > 0).view(-1, 1, 1, 1, 1) * mask['head_z']
+		anti_mask['head_z'] = (anti_mask['head_layer_z'] > 0).view(-1, 1, 1, 1, 1) * anti_mask['head_z']
 		return (mask, anti_mask) if paired else (mask, )
 
 	def get_next_batch(self, is_train=True):
@@ -288,7 +299,10 @@ class My_Trainer(Trainer):
 			self.base_zs[k] = (shapley_bool * 1.0 / 2.0).view(orig_shape)
 			if k == 'intermediate_z':
 				self.base_zs[k] = (self.base_zs['mlp_z'] > 0).view(-1, 1, 1, 1) * self.base_zs[k]
-			occupancies[k] = (self.base_zs[k] * 2.0).mean().item() # Because we have 0.5 as the bernoulli probability
+			if k == 'head_z':
+				self.base_zs[k] = (self.base_zs['head_layer_z'] > 0).view(-1, 1, 1, 1, 1) * self.base_zs[k]
+			# Because we have 0.5 as the bernoulli probability
+			occupancies[k] = (self.base_zs[k] * 2.0).mean().item()
 			pointer += numel_
 
 		base_zs_clone = {}
@@ -310,7 +324,8 @@ class My_Trainer(Trainer):
 
 		# Get the surviving nodes
 		threshold = np.quantile(active_shapley, self.additional_args.quantile_cutoff)
-		shapley_bool = (shapley_values > threshold) * all_active_nodes * 2 # to account for all active nodes being 0.5
+		# to account for all active nodes being 0.5
+		shapley_bool = (shapley_values > threshold) * all_active_nodes * 2
 
 		occupancies = {}
 		pointer = 0
@@ -320,7 +335,10 @@ class My_Trainer(Trainer):
 			self.base_zs[k] = (torch.FloatTensor(shapley_bool[pointer : pointer + numel_]) / 2.0).view(orig_shape)
 			if k == 'intermediate_z':
 				self.base_zs[k] = (self.base_zs['mlp_z'] > 0).view(-1, 1, 1, 1) * self.base_zs[k]
-			occupancies[k] = (self.base_zs[k] * 2.0).mean().item() # Because we have 0.5 as the bernoulli probability
+			if k == 'head_z':
+				self.base_zs[k] = (self.base_zs['head_layer_z'] > 0).view(-1, 1, 1, 1, 1) * self.base_zs[k]
+			# Because we have 0.5 as the bernoulli probability
+			occupancies[k] = (self.base_zs[k] * 2.0).mean().item()
 			pointer += numel_
 
 		base_zs_clone = {}

@@ -13,16 +13,17 @@ from pprint import pprint
 from copy import deepcopy
 from torch.nn.init import kaiming_normal_
 from sklearn.metrics import r2_score
+from scipy.stats import kendalltau
 from collections import Counter
 
 training_config = {
-	'lr' :1e-4,
+	'lr' :5e-4,
 	'var_lr' : 1.0,
 	'bsz' : 16,
-	'y_var': 0.0001,#25,
+	'y_var': 1e-4, #25,
 	'nepochs' : 30,
 	'prior_reg_weight': 2.0,
-	'patience': 5,
+	'patience': 10,
 }
 
 EPS = 1e-10
@@ -41,53 +42,38 @@ def get_score_model(config, num_layers, num_players, model_type, reg_weight, wan
 
 
 class LinearModel(nn.Module):
-	def __init__(self, num_players, reg_scales=None):
+	def __init__(self, num_players, reg_weight=None):
 		super(LinearModel, self).__init__()
 		self.score_tensor = nn.parameter.Parameter(create_tensor((num_players + 1, 1)))
-		self.variances = nn.parameter.Parameter(create_tensor((num_players + 1, 1)) - np.log(num_players**2)) 
 		self.num_players = num_players
 		self.base_mask = None
-		self.l1_weights = reg_scales.to(self.score_tensor.device).view(self.score_tensor.shape)
-		self.l1_weights.requires_grad = False
+		self.reg_weight = reg_weight
 
-	def reset_linear(self):
+	def set_prior_variance(self, prior_variance):
+		self.prior_variance = prior_variance
+
+	def reset_linear(self, bias_init):
 		del self.score_tensor
-		del self.variances
 		self.score_tensor = nn.parameter.Parameter(create_tensor((self.num_players + 1, 1)))
-		init_scale = - np.log((self.base_mask.sum().item())**2)
-		self.variances = nn.parameter.Parameter(create_tensor((self.num_players + 1, 1)) + init_scale)
+		with torch.no_grad():
+			self.score_tensor[-1, 0] = bias_init
 
-	def regLoss(self):
-		inv_variances = 1.0 / self.variances.exp()
-		inv_variances *= self.l1_weights
-		weighted_l2 = (self.score_tensor**2  * inv_variances)[:-1, :]
+	def regLoss(self, mean_score_tensor):
+		mean_score_tensor = 0.0 if mean_score_tensor is None else mean_score_tensor
+		weighted_l2 = (self.score_tensor - mean_score_tensor)**2  * self.prior_variance
 		return weighted_l2.sum()
-		
-# 		l1 = self.score_tensor.abs()
-# 		if self.base_mask is not None:
-# 			l1 = l1 * (self.base_mask.view(l1.shape))
-# 		return (l1 * self.l1_weights).sum()
-
 
 	def forward(self, xs):
 		return torch.matmul(xs, self.score_tensor)
 
 	def get_scores(self, base_mask):
-		base_mask[-1] = 0 # Do not include the bias term
+		assert base_mask[-1] == 1, 'The bias term should be on'
 		with torch.no_grad():
 			predictions = self.score_tensor.detach()
-			stds = self.variances.detach().exp().sqrt()
-
-			active_preds = predictions[base_mask > 0]
-			base_mask[-1] = 0
-			active_stds = stds[base_mask > 0]
-			base_mask[-1] = 1
+			active_preds = predictions[base_mask > 0][:-1, :]
 
 		stats = active_preds.mean().item(), active_preds.std().item(), active_preds.max().item(), active_preds.min().item()
 		print("Predictions vals : Mean {:.7f}, Std {:.7f}, Max {:.7f}, Min {:.7f}".format(*stats))
-
-		stats = active_stds.mean().item(), active_stds.std().item(), active_stds.max().item(), active_stds.min().item()
-		print("Predictions Stds : Mean {:.7f}, Std {:.7f}, Max {:.7f}, Min {:.7f}".format(*stats))
 
 		return predictions[:-1] # Do not include the last entry because this is the bias
 
@@ -95,29 +81,25 @@ class LinearModel(nn.Module):
 		self.base_mask = base_mask.to(self.score_tensor.device)
 		assert self.base_mask[-1] == 1, 'The bias term should be on!'
 
+
 class ScoreModel(nn.Module):
 	def __init__(self, module_config, num_layers=12, num_players=None, reg_weight=1e-7, wandb=None):
 		super(ScoreModel, self).__init__()
 
-		reg_scales = []
-		reg_dict = {
-						'head_z': 1, 'mlp_z' : 1, 
-						'intermediate_z':1, 'hidden_z':1
-		}
-		for k, v in module_config.items():
-			scale = reg_weight * reg_dict[k]
-			reg_scales.append(torch.ones(v.numel()) * scale)
-		reg_scales.append(torch.tensor([reg_weight]))
-		reg_scales = torch.concat(reg_scales)
-		self.base_model = LinearModel(num_players, reg_scales=reg_scales)
+		self.reg_weight = reg_weight
+		self.base_model = LinearModel(num_players, reg_weight=reg_weight)
 		self.loss_fn = nn.MSELoss()
 		self.candidate_buffer = []
 		self.curr_norm = 1.0
 		self.wandb = wandb
 		self.overall_iter = 0
-	
-	def reset_linear(self):
-		self.base_model.reset_linear()
+
+	def set_prior_variance(self, prior_variance):
+		self.prior_variance = prior_variance
+		self.base_model.set_prior_variance(prior_variance)
+
+	def reset_linear(self, bias_init):
+		self.base_model.reset_linear(bias_init)
 
 	def config_to_model_info(self, config, use_all=False):
 		base_vec = []
@@ -152,12 +134,15 @@ class ScoreModel(nn.Module):
 
 			# Do a selection based on UCB
 			with torch.no_grad():
-				stds = (self.base_model.variances.exp()).sqrt()
 				preds_ = normed_rand_sample.matmul(self.base_model.score_tensor)
+				normed_rand_sample = normed_rand_sample
 
-				normed_rand_sample[:, -1] = 0
-				stds_ = normed_rand_sample.matmul(stds)
+				stds_ = (normed_rand_sample.matmul(self.cov_mat) * normed_rand_sample).sum(axis=-1, keepdim=True)
+				stds_ = stds_.sqrt()
+				print('Pred range : ', preds_.max().item(), preds_.min().item())
+				print('Stds range : ', stds_.max().item(), stds_.min().item())
 				total = (preds_ + stds_).squeeze()
+				print('Totals range : ', total.max().item(), total.min().item())
 				stats = total.mean().item(), total.max().item(), total.min().item()
 				if self.wandb is not None:
 					self.wandb.log({
@@ -171,7 +156,7 @@ class ScoreModel(nn.Module):
 
 		return self.candidate_buffer.pop()
 
-	def run_epoch(self, epoch_, xs, ys, is_train=True):
+	def run_epoch(self, epoch_, xs, ys, mean=None, is_train=True):
 		# generate a permutation
 		perm = np.random.permutation(len(ys))
 		running_loss_avg = 0.0
@@ -179,6 +164,7 @@ class ScoreModel(nn.Module):
 		if not is_train:
 			self.base_model.eval()
 		max_error, min_error = -1, 1
+		all_preds, all_ys = [], []
 		for batch_id in range(n_batches):
 			start_, end_ = int(training_config['bsz'] * batch_id), int(training_config['bsz'] * (batch_id + 1))
 			xs_masks = torch.stack([xs[i_] for i_ in perm[start_:end_]]).float().cuda()
@@ -188,7 +174,10 @@ class ScoreModel(nn.Module):
 			preds = self.forward(xs_masks)
 
 			loss = self.loss_fn(preds, this_ys)
-			regLoss = self.base_model.regLoss()
+			regLoss = self.base_model.regLoss(mean) * self.reg_weight
+
+			all_ys.append(this_ys.cpu().numpy())
+			all_preds.append(preds.detach().cpu().numpy())
 
 			if batch_id == 0:
 				for p_ in zip(
@@ -217,80 +206,21 @@ class ScoreModel(nn.Module):
 		running_loss_avg /= n_batches
 		if not is_train:
 			self.base_model.train()
-		return running_loss_avg, max_error, min_error
-
-
-	def fit_variances(self, tr, ts):
-
-		def print_state(desc):
-			with torch.no_grad():
-				chosen = (self.base_model.variances.exp().sqrt())[:-1]
-				if self.base_model.base_mask is not None:
-					chosen = chosen[self.base_model.base_mask[:-1] > 0] 
-				mean_, max_, min_ = chosen.mean().item(), chosen.max().item(), chosen.min().item()
-				print('\t', desc, '[Vars] Mean : {:.7f} | Max : {:.7f} | Min : {:.7f}'.format(mean_, max_, min_))
-
-		print_state('Before Iter')
-
-		# We are removing the last dimension to make the optimization more stable
-		tr_xs, tr_ys = tr
-		tr_xs = torch.stack(tr_xs)[:, :-1].float().cuda()
-		tr_ys = tr_ys.view(1, -1)
-
-		ts_xs, ts_ys = ts
-		ts_xs = torch.stack(ts_xs)[:, :-1].float().cuda()
-		ts_ys = ts_ys.view(1, -1)
-		
-		var_optim = Adam([self.base_model.variances], lr=training_config['var_lr'])
-
-		def marginal_likelihood(xs, ys):
-			vars_ = (self.base_model.variances.exp().T)[:, :-1] / training_config['y_var']
-			C_mat = torch.eye(ys.shape[-1], device=ys.device)
-			C_mat += (xs * vars_).matmul(xs.T)
-			l1 = ys.matmul(torch.inverse(C_mat)).matmul(ys.T)
-			l2 = torch.logdet(C_mat)
-			return l1, l2
-
-		best_loss, clone, since_best = 1e10, None, 0
-		for iter_ in range(training_config['nepochs']):
-			loss_terms = marginal_likelihood(tr_xs, tr_ys)
-			reg_term = training_config['prior_reg_weight'] * loss_terms[1]
-			loss = loss_terms[0] + reg_term #torch.clamp(reg_term, min=0.0)
-			print('[Epoch {}] | Loss : {:.7f} | T1 : {:.7f} | T2 : {:.7f} '.format(
-				iter_, loss.item(), loss_terms[0].item(), reg_term.item())
-			)
-
-			loss.backward()
-			var_optim.step()
-			var_optim.zero_grad()
-
-			with torch.no_grad():
-				loss_terms = marginal_likelihood(ts_xs, ts_ys)
-				reg_term = training_config['prior_reg_weight'] * loss_terms[1]
-				loss = loss_terms[0] + reg_term #torch.clamp(reg_term, min=0.0)
-			# check the validation performance and cache
-			if loss.item() < best_loss:
-				print('New Best Variance Model Achieved - old = {:.7f} | new = {:.7f}'.format(best_loss, loss.item()))
-				best_loss = loss.item()
-				clone = deepcopy(self.base_model)
-				since_best = 0
-
-			since_best += 1
-			if since_best > 5:
-				break
-
-		del self.base_model
-		self.base_model = clone
-		print_state('After Iter')
+		# Compute the kendalltau statistic
+		kendall_tau = kendalltau(np.concatenate(all_preds), np.concatenate(all_ys)).correlation
+		return running_loss_avg, max_error, min_error, kendall_tau
 
 
 	def update_with_info(self, run_info):
 		self.overall_iter += 1
 		xs, ys = run_info
 		normalization = self.base_model.num_players if self.base_model.base_mask is None else self.base_model.base_mask.sum().item()
+
 		normalization = np.sqrt(normalization)
+		self.set_prior_variance(1.0/normalization)
 		self.curr_norm = normalization
 		print('This is the normalization : ', normalization)
+
 		# Split into train and test
 		perm = np.random.permutation(len(ys))
 		trn_list, tst_list = perm[:int(0.8 * len(perm))], perm[int(0.8 * len(perm)):]
@@ -301,45 +231,56 @@ class ScoreModel(nn.Module):
 		ts_xs, ts_ys = [xs[i] / normalization for i in tst_list], [ys[i] for i in tst_list]
 		ts_ys  = torch.tensor(ts_ys).float().cuda()
 
-		self.fit_variances((tr_xs, tr_ys), (ts_xs, ts_ys))
+		with torch.no_grad():
+			mean_score_tensor = self.base_model.score_tensor.detach()
+			mean_score_tensor.requires_grad = False
+
+		bias_init = tr_ys.mean().item() * normalization
+		self.base_model.reset_linear(bias_init)
 
 		# Setup the optimizer.
 		self.score_optim = Adam([self.base_model.score_tensor], lr=training_config['lr'])
-		lr_scheduler = ReduceLROnPlateau(self.score_optim, mode='min', factor=0.5, patience=3, verbose=True, min_lr=1e-5)
-		best_loss, clone, since_best = 1e10, None, 0
+		lr_scheduler = ReduceLROnPlateau(self.score_optim, mode='max', factor=0.5, patience=3, verbose=True, min_lr=1e-5)
+		best_tau, clone, since_best = -1e5, None, 0
 		for epoch_ in range(training_config['nepochs']):
 
 			print('Epoch - ', epoch_)
-			run_out = self.run_epoch(epoch_, tr_xs, tr_ys)
-			print('Epoch {} [Trn] | Loss : {:.5f} | Max Error : {:.5f} | Min Error : {:.5f}'.format(epoch_, *run_out))
+			run_out = self.run_epoch(epoch_, tr_xs, tr_ys, mean=mean_score_tensor)
+			print('Epoch {} [Trn] | Loss : {:.5f} | Max Error : {:.5f} | Min Error : {:.5f} | Kendall Tau : {:.5f}'.format(epoch_, *run_out))
 			run_out = self.run_epoch(epoch_, ts_xs, ts_ys, is_train=False)
-			print('Epoch {} [Tst] | Loss : {:.5f} | Max Error : {:.5f} | Min Error : {:.5f}'.format(epoch_, *run_out))
+			print('Epoch {} [Tst] | Loss : {:.5f} | Max Error : {:.5f} | Min Error : {:.5f} | Kendall Tau : {:.5f}'.format(epoch_, *run_out))
 
-			if run_out[0] < best_loss:
+			if run_out[-1] > best_tau:
 				print('New Best Score Model Achieved')
-				best_loss = run_out[0]
+				best_tau = run_out[-1]
 				clone = deepcopy(self.base_model)
 				since_best = 0
 
-			lr_scheduler.step(run_out[0]) # step based on the max error
+			lr_scheduler.step(run_out[-1]) # step based on the max error
 			since_best += 1
-			if since_best > 5:
+			if since_best > training_config['patience']:
 				break
 
 		del self.base_model
 		self.base_model = clone
 
 		with torch.no_grad():
+			tr_xs = torch.stack(tr_xs).cuda()
+
+			variances = (tr_xs.T).matmul(tr_xs)
+			print('Max : ', variances.max(), 'Min : ', variances.min().item())
+			variances += (torch.eye(tr_xs.shape[-1]).cuda() * self.prior_variance)
+			self.cov_mat = training_config['y_var'] * torch.linalg.inv(variances)
+
 			ts_xs = torch.stack(ts_xs).float().cuda()
 			ts_ys = ts_ys.cpu().numpy()
 			with torch.no_grad():
 				preds = self.base_model.forward(ts_xs).squeeze()
 				preds = preds.detach().cpu().numpy()
 
-			our_coef_det = r2_score(ts_ys, preds)
 			base_pred = np.ones_like(ts_ys) * tr_ys.mean().item()
-			base_coef_det = r2_score(ts_ys, base_pred)
-			print('Our R^2 = {:.4f} | Naive Mean R^2 = {:.4f}'.format(our_coef_det, base_coef_det))
+			base_coef_det = kendalltau(ts_ys, base_pred)
+			print('Our KendallTau = ', best_tau, ' | Naive Mean KendallTau = ', base_coef_det.correlation)
 			our_max_err = max(np.abs(ts_ys - preds))
 			base_maxerr = max(np.abs(ts_ys - base_pred))
 			print('Our MaxError = {:.4f} | Naive Mean MaxErr = {:.4f}'.format(our_max_err, base_maxerr))
@@ -349,7 +290,7 @@ class ScoreModel(nn.Module):
 			if self.wandb is not None:
 				self.wandb.log({
 					'epoch': self.overall_iter,
-					'r^2/ours': our_coef_det, 'r^2/naive': base_coef_det,
+					'kt/ours': best_tau, 'kt/naive': base_coef_det,
 					'loss/ours': our_loss, 'loss/naive': naive_loss,
 					'maxerr/ours': our_max_err, 'maxerr/naive': base_maxerr,
 				})
