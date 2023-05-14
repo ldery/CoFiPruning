@@ -229,46 +229,21 @@ class My_Trainer(Trainer):
 	
 	def get_mask_perf(self, cur_mask, fitness_strategy=None):
 		fitness_strategy = fitness_strategy if fitness_strategy else self.fitness_strategy
-		if fitness_strategy == 'linear_fit':
-			results = []
-			with torch.no_grad():
-				val_inputs = self.get_next_batch(is_train=False)
-				val_outputs = self.run_through_model(cur_mask, val_inputs)
-			for _ in range(self.nscoringfn_runs):
-				with torch.no_grad():
-					# Get a batch of data
-					tr_inputs = self.get_next_batch(is_train=True)
-					tr_outputs = self.run_through_model(cur_mask, tr_inputs)
-				results.append(self.linear_fit_and_evaluate(tr_outputs, val_outputs))
-			return np.mean(results)
-		elif fitness_strategy == 'embedding_cosine':
-			assert self.teacher_model is not None, 'To use this strategy the teacher must be available'
-			results = []
-			for _ in range(self.nscoringfn_runs):
-				with torch.no_grad():
-					tr_inputs = self.get_next_batch(is_train=True)
-					original_embeds = self.teacher_model(** self._prepare_inputs(tr_inputs))['pooler_output']
-					masked_embeds = self.run_through_model(cur_mask, tr_inputs)[0]
-					cos_scores = nn.CosineSimilarity(dim=-1, eps=1e-6)(masked_embeds, original_embeds) + 1.0
-				results.append(cos_scores.mean().item())
-			return np.mean(results)
-		elif fitness_strategy == 'transRate':
-			results = []
-			with torch.no_grad():
-				val_inputs = self.get_next_batch(is_train=False)
-				val_outputs = self.run_through_model(cur_mask, val_inputs)
-			for _ in range(self.nscoringfn_runs):
-				with torch.no_grad():
-					# Get a batch of data
-					tr_inputs = self.get_next_batch(is_train=True)
-					tr_outputs = self.run_through_model(cur_mask, tr_inputs)
+		all_scores = []
+# 		if fitness_strategy == 'linear_fit':
+		results = []
+		with torch.no_grad():
+			val_inputs = self.get_next_batch(is_train=False)
+			val_outputs = self.run_through_model(cur_mask, val_inputs)
+			tr_inputs = self.get_next_batch(is_train=True)
+			original_embeds = self.teacher_model(** self._prepare_inputs(tr_inputs))['pooler_output']
 
-					Z, y = torch.concat([tr_outputs[0], val_outputs[0]]), torch.concat([tr_outputs[1], val_outputs[1]])
-					transrate = transRate(Z, y)
-					results.append(transrate)
-			return np.mean(results)
-		else: 
-			raise ValueError('Incorrect fitness strategy specified : ', fitness_strategy)
+			tr_outputs = self.run_through_model(cur_mask, tr_inputs)
+			cos_scores = nn.CosineSimilarity(dim=-1, eps=1e-6)(tr_outputs[0], original_embeds) + 1.0
+			Z, y = torch.concat([tr_outputs[0], val_outputs[0]]), torch.concat([tr_outputs[1], val_outputs[1]])
+			transrate = transRate(Z, y)
+		accuracy = self.linear_fit_and_evaluate(tr_outputs, val_outputs)
+		return [accuracy, cos_scores.mean().item(), transrate]
 
 	def normalize_scores(self, scores, type_=None):
 		mean_, std_ = np.nanmean(scores), np.nanstd(scores)
@@ -393,11 +368,12 @@ class My_Trainer(Trainer):
 					mask_clone[k] = cur_mask[k]
 				bool_vecs.append(self.scoring_model.config_to_model_info(mask_clone))
 				scores.append(this_perf)
-
-				if this_perf > best_perf_so_far:
-					best_perf_so_far = this_perf
+				if this_perf[0] > best_perf_so_far:
+					best_perf_so_far = this_perf[0]
 					best_random_mask = cur_mask
-
+		scores = np.array(scores)
+		scores = (scores - np.min(scores, axis=0))/(np.max(scores, axis=0) - np.min(scores, axis=0))
+		scores = scores.mean(axis=-1)
 		return best_perf_so_far, best_random_mask, (bool_vecs, scores)
 
 	def train(self):
@@ -430,11 +406,11 @@ class My_Trainer(Trainer):
 			for k in self.arch_comp_keys:
 				cur_best_mask[k] *= 2.0
 
-			our_perf = self.get_mask_perf(cur_best_mask)
+			our_perf = self.get_mask_perf(cur_best_mask)[0]
 			print('\t', '[{}] Best Random Perf : {:.3f}. Our Perf : {:.3f}'.format(self.fitness_strategy, best_perf, our_perf))
 			if self.additional_args.fitness_strategy != 'linear_fit':
-				best_perf = self.get_mask_perf(best_random_mask, fitness_strategy='linear_fit') if best_random_mask else None
-				our_perf = self.get_mask_perf(cur_best_mask, fitness_strategy='linear_fit')
+				best_perf = self.get_mask_perf(best_random_mask, fitness_strategy='linear_fit')[0] if best_random_mask else None
+				our_perf = self.get_mask_perf(cur_best_mask, fitness_strategy='linear_fit')[0]
 				print('\t', '[Linear Fit]| Best Random Perf : {:.3f}. Our Perf : {:.3f}'.format(best_perf, our_perf))
 
 			# Caching for saving in case this is the last round
