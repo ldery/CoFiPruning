@@ -19,7 +19,7 @@ from collections import Counter
 training_config = {
 	'lr' :5e-4,
 	'var_lr' : 1.0,
-	'bsz' : 16,
+	'bsz' : 256,
 	'y_var': 1e-4, #25,
 	'nepochs' : 30,
 	'prior_reg_weight': 2.0,
@@ -122,37 +122,37 @@ class ScoreModel(nn.Module):
 
 	def get_candidate(self, pool_size=10000):
 		if len(self.candidate_buffer) == 0: 
-			pool_size = 1 if self.base_model.base_mask is None else pool_size
+			pool_size = 1 #if self.base_model.base_mask is None else pool_size
 			base_set = torch.zeros(pool_size, self.base_model.num_players + 1, device=self.base_model.score_tensor.device) + 0.5
 			random_sample = torch.bernoulli(base_set)
-			if self.base_model.base_mask is None:
-				return random_sample.cpu().squeeze()
+# 			if self.base_model.base_mask is None:
+			return random_sample.cpu().squeeze()
 
-			random_sample *= self.base_model.base_mask
-			random_sample[:, -1] = 1
-			normed_rand_sample = random_sample / self.curr_norm
+# 			random_sample *= self.base_model.base_mask
+# 			random_sample[:, -1] = 1
+# 			normed_rand_sample = random_sample / self.curr_norm
 
-			# Do a selection based on UCB
-			with torch.no_grad():
-				preds_ = normed_rand_sample.matmul(self.base_model.score_tensor)
-				normed_rand_sample = normed_rand_sample
+# 			# Do a selection based on UCB
+# 			with torch.no_grad():
+# 				preds_ = normed_rand_sample.matmul(self.base_model.score_tensor)
+# 				normed_rand_sample = normed_rand_sample
 
-				stds_ = (normed_rand_sample.matmul(self.cov_mat) * normed_rand_sample).sum(axis=-1, keepdim=True)
-				stds_ = stds_.sqrt()
-				print('Pred range : ', preds_.max().item(), preds_.min().item())
-				print('Stds range : ', stds_.max().item(), stds_.min().item())
-				total = (preds_ + stds_).squeeze()
-				print('Totals range : ', total.max().item(), total.min().item())
-				stats = total.mean().item(), total.max().item(), total.min().item()
-				if self.wandb is not None:
-					self.wandb.log({
-						'epoch': self.overall_iter, 'candidates/mean': stats[0],
-						'candidates/max': stats[1], 'candidates/min': stats[2]
-					})
-				print('[Exp] Mean : {:.4f} | Max : {:.4f} | Min : {:.4f}'.format(*stats))
-				chosen_idx = torch.argsort(total)[-10:]
-				chosen = random_sample[chosen_idx].cpu()
-				self.candidate_buffer.extend(chosen.unbind())
+# 				stds_ = (normed_rand_sample.matmul(self.cov_mat) * normed_rand_sample).sum(axis=-1, keepdim=True)
+# 				stds_ = stds_.sqrt()
+# 				print('Pred range : ', preds_.max().item(), preds_.min().item())
+# 				print('Stds range : ', stds_.max().item(), stds_.min().item())
+# 				total = (preds_ + stds_).squeeze()
+# 				print('Totals range : ', total.max().item(), total.min().item())
+# 				stats = total.mean().item(), total.max().item(), total.min().item()
+# 				if self.wandb is not None:
+# 					self.wandb.log({
+# 						'epoch': self.overall_iter, 'candidates/mean': stats[0],
+# 						'candidates/max': stats[1], 'candidates/min': stats[2]
+# 					})
+# 				print('[Exp] Mean : {:.4f} | Max : {:.4f} | Min : {:.4f}'.format(*stats))
+# 				chosen_idx = torch.argsort(total)[-10:]
+# 				chosen = random_sample[chosen_idx].cpu()
+# 				self.candidate_buffer.extend(chosen.unbind())
 
 		return self.candidate_buffer.pop()
 
@@ -235,7 +235,7 @@ class ScoreModel(nn.Module):
 			mean_score_tensor = self.base_model.score_tensor.detach()
 			mean_score_tensor.requires_grad = False
 
-		bias_init = tr_ys.mean().item() * normalization
+		bias_init = 0 #tr_ys.mean().item() * normalization
 		self.base_model.reset_linear(bias_init)
 
 		# Setup the optimizer.
